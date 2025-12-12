@@ -1,6 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
 import React, { useMemo, useState } from 'react';
-import { FlatList, Pressable, SafeAreaView, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
+import { FlatList, Image, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import { Swipeable, GestureHandlerRootView } from 'react-native-gesture-handler';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
@@ -13,7 +13,11 @@ import {
   Manrope_600SemiBold,
   Manrope_700Bold,
 } from '@expo-google-fonts/manrope';
-import { Accelerometer, Barometer, Gyroscope, Magnetometer } from 'expo-sensors';
+import { Barometer, DeviceMotion, Magnetometer, Pedometer } from 'expo-sensors';
+import { pilotStoreMap, type StoreMap, type StoreMapAnchor, type StoreMapNode } from './navigation/storeMap';
+import { computePolylineForOrder, computeRouteOrder } from './navigation/routing';
+import { scanWifiReadings } from './navigation/wifi';
+import { planConfigs, type PlanId } from './navigation/houseFloorplan';
 
 type HouseholdRole = 'owner' | 'editor' | 'viewer';
 type HouseholdMember = {
@@ -60,16 +64,118 @@ type TierId = 'free' | 'pro' | 'family';
 type Locale = 'de' | 'en';
 type TabId = 'home' | 'list' | 'recipes' | 'nav' | 'plans';
 type SortMode = 'category' | 'aisle' | 'priority';
-type FloorNode = { id: string; row: number; col: number; label: string; sectionId?: string };
 type PdrState = {
   steps: number;
   heading: number;
+  gyroHeading: number;
+  magHeading: number;
   floor: number;
   pressure: number;
   status: 'idle' | 'tracking' | 'denied';
 };
-type WifiAnchor = { bssid: string; label: string; row: number; col: number; source: 'mock' | 'live'; confidence?: number };
 type PdrPoint = { x: number; y: number };
+type NavNode = StoreMapNode;
+type MotionDebug = {
+  accelMag: number;
+  accelBaseline: number;
+  accelDiff: number;
+  stepThreshold: number;
+  stepLength: number;
+  lastStepAt: number | null;
+  lastIntervalMs: number;
+  isStationary: boolean;
+  stepSource: 'deviceMotion' | 'pedometer' | 'none';
+  deviceMotionLinAccMag: number;
+  pedometerSteps: number;
+  deviceSteps: number;
+};
+type SensorHealth = {
+  accel: { available: boolean | null; lastAt: number | null; error?: string };
+  gyro: { available: boolean | null; lastAt: number | null; error?: string };
+  mag: { available: boolean | null; lastAt: number | null; error?: string };
+  baro: { available: boolean | null; lastAt: number | null; error?: string };
+  deviceMotion: { available: boolean | null; lastAt: number | null; error?: string };
+  pedometer: { available: boolean | null; lastAt: number | null; error?: string; permission?: string };
+};
+
+type PlanTool = 'start' | 'measure' | 'anchor';
+
+const FloorplanImageCanvas: React.FC<{
+  source: any;
+  imagePixelsPerMeter: number;
+  path: PdrPoint[];
+  current?: PdrPoint;
+  onTapMeters?: (pMeters: PdrPoint, pImagePx: { x: number; y: number }) => void;
+}> = ({ source, imagePixelsPerMeter, path, current, onTapMeters }) => {
+  const [layout, setLayout] = React.useState<{ w: number; h: number } | null>(null);
+  const resolved = Image.resolveAssetSource(source);
+  const imgW = resolved?.width ?? 1;
+  const imgH = resolved?.height ?? 1;
+  const scale = layout ? Math.min(layout.w / imgW, layout.h / imgH) : 1;
+  const dispW = imgW * scale;
+  const dispH = imgH * scale;
+  const offsetX = layout ? (layout.w - dispW) / 2 : 0;
+  const offsetY = layout ? (layout.h - dispH) / 2 : 0;
+  const ppm = Math.max(0.0001, imagePixelsPerMeter);
+  const toContainer = (p: PdrPoint) => ({
+    x: offsetX + p.x * ppm * scale,
+    y: offsetY + p.y * ppm * scale,
+  });
+
+  return (
+    <View
+      style={styles.planWrap}
+      onLayout={(e) => setLayout({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height })}
+    >
+      <Pressable
+        style={{ flex: 1 }}
+        onPress={(e) => {
+          if (!layout) return;
+          const x = e.nativeEvent.locationX;
+          const y = e.nativeEvent.locationY;
+          const ix = Math.max(0, Math.min(imgW, (x - offsetX) / scale));
+          const iy = Math.max(0, Math.min(imgH, (y - offsetY) / scale));
+          onTapMeters?.({ x: ix / ppm, y: iy / ppm }, { x: ix, y: iy });
+        }}
+      >
+        <Image source={source} style={styles.planImage} resizeMode="contain" />
+        <View pointerEvents="none" style={styles.planOverlay}>
+          {layout ? (
+            <>
+              {path.map((p, idx) => (
+                (() => {
+                  const c = toContainer(p);
+                  return (
+                <View
+                  key={`p-${idx}`}
+                  style={[
+                    styles.planPathDot,
+                    { left: c.x - 2, top: c.y - 2 },
+                  ]}
+                />
+                  );
+                })()
+              ))}
+              {current ? (
+                (() => {
+                  const c = toContainer(current);
+                  return (
+                <View
+                  style={[
+                    styles.planCurrentDot,
+                    { left: c.x - 7, top: c.y - 7 },
+                  ]}
+                />
+                  );
+                })()
+              ) : null}
+            </>
+          ) : null}
+        </View>
+      </Pressable>
+    </View>
+  );
+};
 
 const wrapHeading = (deg: number) => {
   const h = deg % 360;
@@ -88,10 +194,7 @@ const tabs: { id: TabId; label: string; icon: keyof typeof Ionicons.glyphMap }[]
   { id: 'plans', label: 'Pläne', icon: 'card-outline' },
 ];
 
-const wifiAnchorsConfig: WifiAnchor[] = [
-  { bssid: 'AA:BB:CC:DD:EE:01', label: 'Router', row: 0, col: 0, source: 'mock', confidence: 0.85 },
-  { bssid: 'AA:BB:CC:DD:EE:02', label: 'AP', row: 5, col: 5, source: 'mock', confidence: 0.7 },
-];
+const defaultStoreMap: StoreMap = pilotStoreMap;
 
 const colors = {
   background: '#F7F1E8', // cozy base
@@ -190,11 +293,6 @@ const storeSections: StoreSection[] = [
 const productCatalog: { name: string; sectionId: string; category: string }[] = storeSections.flatMap((section) =>
   section.items.map((name) => ({ name, sectionId: section.id, category: section.label })),
 );
-
-const baseFloorNodes: FloorNode[] = [
-  { id: 'entry', row: 0, col: 0, label: 'Eingang' },
-  { id: 'exit', row: 5, col: 5, label: 'Kasse' },
-];
 
 const tiers: Record<TierId, { price: string; tagline: string; perks: string[] }> = {
   free: {
@@ -309,23 +407,23 @@ const RecipeCard: React.FC<{
 );
 
 const FloorplanCanvas: React.FC<{
-  nodes: FloorNode[];
+  nodes: NavNode[];
   routeOrder: string[];
   visited: string[];
   gridSize?: number;
   startId?: string;
-  onSelectNode?: (node: FloorNode) => void;
+  onSelectNode?: (node: NavNode) => void;
   path?: PdrPoint[];
   current?: PdrPoint;
 }> = ({ nodes, routeOrder, visited, gridSize = 6, startId, onSelectNode, path = [], current }) => {
   const [cellSize, setCellSize] = React.useState(0);
   const cells = Array.from({ length: gridSize }, (_, row) =>
     Array.from({ length: gridSize }, (_, col) => {
-      const node = nodes.find((n) => n.row === row && n.col === col);
+      const node = nodes.find((n) => Math.floor(n.y) === row && Math.floor(n.x) === col);
       const isRoute = node ? routeOrder.includes(node.id) : false;
       const isVisited = node ? visited.includes(node.id) : false;
-      const isEntry = node?.id === 'entry';
-      const isExit = node?.id === 'exit';
+      const isEntry = node?.type === 'entry' || node?.id === 'entry';
+      const isExit = node?.type === 'exit' || node?.id === 'exit';
       const isStart = node?.id === startId;
       const isPath = path.some((p) => Math.floor(p.y) === row && Math.floor(p.x) === col);
       const isCurrent = current ? Math.floor(current.y) === row && Math.floor(current.x) === col : false;
@@ -933,8 +1031,9 @@ const RecipesSection: React.FC<{
 );
 
 const NavigationSection: React.FC<{
+  storeMap: StoreMap;
   items: ShoppingItem[];
-  customNodes: FloorNode[];
+  customNodes: NavNode[];
   addNode: (label: string, sectionId: string, row: number, col: number) => void;
   clearNodes: () => void;
   optimiseRoute: () => void;
@@ -948,14 +1047,40 @@ const NavigationSection: React.FC<{
   startNodeId: string;
   onSelectStart: (id: string) => void;
   pdrPath: PdrPoint[];
-  wifiAnchor: WifiAnchor | null;
+  motionDebug: MotionDebug;
+  sensorHealth: SensorHealth;
+  wifiAnchor: StoreMapAnchor | null;
   wifiStatus: 'mock' | 'live' | 'off';
-  onMockAnchor: (anchor: WifiAnchor) => void;
+  onMockAnchor: (anchor: StoreMapAnchor) => void;
+  onScanWifi?: () => void;
   wifiConfidence: number;
-  testMode: boolean;
+  testMode?: boolean;
   pdrConfidence: 'good' | 'ok' | 'low';
   onRecenter: () => void;
+  mapMode: 'pilot' | 'house';
+  onChangeMapMode: (m: 'pilot' | 'house') => void;
+  planId: 'house' | 'neue';
+  onChangePlanId: (id: 'house' | 'neue') => void;
+  planImage: any;
+  planImagePixelsPerMeter: number;
+  setPlanImagePixelsPerMeter: (n: number) => void;
+  planDefaultImagePixelsPerMeter?: number;
+  planTool: PlanTool;
+  setPlanTool: (t: PlanTool) => void;
+  planMeasureA: { x: number; y: number } | null;
+  planMeasureB: { x: number; y: number } | null;
+  setPlanMeasureA: (p: { x: number; y: number } | null) => void;
+  setPlanMeasureB: (p: { x: number; y: number } | null) => void;
+  onSetAnchorAt?: (pMeters: PdrPoint) => void;
+  planCalA: { x: number; y: number } | null;
+  planCalB: { x: number; y: number } | null;
+  setPlanCalA: (p: { x: number; y: number } | null) => void;
+  setPlanCalB: (p: { x: number; y: number } | null) => void;
+  planCalMeters: string;
+  setPlanCalMeters: (v: string) => void;
+  onPlanTap: (pMeters: PdrPoint, pPx: { x: number; y: number }) => void;
 }> = ({
+  storeMap,
   items,
   customNodes,
   addNode,
@@ -971,13 +1096,38 @@ const NavigationSection: React.FC<{
   startNodeId,
   onSelectStart,
   pdrPath,
+  motionDebug,
+  sensorHealth,
   wifiAnchor,
   wifiStatus,
   onMockAnchor,
+  onScanWifi,
   wifiConfidence,
-  testMode,
+  testMode = false,
   pdrConfidence,
   onRecenter,
+  mapMode,
+  onChangeMapMode,
+  planId,
+  onChangePlanId,
+  planImage,
+  planImagePixelsPerMeter,
+  setPlanImagePixelsPerMeter,
+  planDefaultImagePixelsPerMeter,
+  planTool,
+  setPlanTool,
+  planMeasureA,
+  planMeasureB,
+  setPlanMeasureA,
+  setPlanMeasureB,
+  onSetAnchorAt,
+  planCalA,
+  planCalB,
+  setPlanCalA,
+  setPlanCalB,
+  planCalMeters,
+  setPlanCalMeters,
+  onPlanTap,
 }) => {
   const pending = items.filter((i) => i.status === 'pending');
   const done = items.filter((i) => i.status === 'done');
@@ -1015,11 +1165,19 @@ const NavigationSection: React.FC<{
   }, [done]);
   const progress =
     orderedSections.length + doneSections.length === 0 ? 0 : doneSections.length / (orderedSections.length + doneSections.length);
+  const lastStepAgoSec = motionDebug.lastStepAt ? (Date.now() - motionDebug.lastStepAt) / 1000 : null;
+  const cadencePerMin =
+    motionDebug.lastIntervalMs > 0 ? Math.round(60000 / motionDebug.lastIntervalMs) : 0;
+  const stepPulse = lastStepAgoSec !== null && lastStepAgoSec < 0.6;
+  const sensorLabel = (ok: boolean | null) => (ok === null ? '?' : ok ? 'ok' : 'no');
+  const ageSec = (t: number | null) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s` : '—');
+  const gridSize = storeMap.gridSize;
+  const anchors: StoreMapAnchor[] = storeMap.anchors ?? [];
 
   const findFreeSlot = () => {
-    const occupied = [...baseFloorNodes, ...customNodes].map((n) => `${n.row}-${n.col}`);
-    for (let r = 0; r < 6; r += 1) {
-      for (let c = 0; c < 6; c += 1) {
+    const occupied = [...storeMap.nodes, ...customNodes].map((n) => `${Math.floor(n.y)}-${Math.floor(n.x)}`);
+    for (let r = 0; r < gridSize; r += 1) {
+      for (let c = 0; c < gridSize; c += 1) {
         if (!occupied.includes(`${r}-${c}`)) {
           return { row: r, col: c };
         }
@@ -1042,12 +1200,29 @@ const NavigationSection: React.FC<{
     >
       <View style={styles.navInfoCard}>
         <View>
-          <Text style={styles.sectionTitle}>Route aktiv</Text>
-          <Text style={styles.metaMuted}>{orderedSections.length} Stopps • ~{estimatedMinutes} min</Text>
+          <Text style={styles.sectionTitle}>Navigation</Text>
+          <Text style={styles.metaMuted}>
+            {mapMode === 'house' ? 'House Floorplan Mode' : `${orderedSections.length} Stopps • ~${estimatedMinutes} min`}
+          </Text>
         </View>
         <View style={styles.navPills}>
-          <Badge label={`${pending.length} offen`} tone="accent" />
-          <Badge label={`${customNodes.length} Gänge`} tone="muted" />
+          <Badge label={mapMode === 'house' ? 'Plan' : `${pending.length} offen`} tone="accent" />
+          <Badge label={mapMode === 'house' ? 'Free Move' : `${customNodes.length} Gänge`} tone="muted" />
+        </View>
+      </View>
+      <View style={styles.listControlRow}>
+        <View style={styles.segment}>
+          {(['pilot', 'house'] as const).map((m) => (
+            <Pressable
+              key={m}
+              style={[styles.segmentButton, mapMode === m && styles.segmentButtonActive]}
+              onPress={() => onChangeMapMode(m)}
+            >
+              <Text style={[styles.metaText, mapMode === m && { color: colors.ink }]}>
+                {m === 'pilot' ? 'Pilot Store' : 'House Plan'}
+              </Text>
+            </Pressable>
+          ))}
         </View>
       </View>
       <View style={styles.pdrCard}>
@@ -1066,14 +1241,69 @@ const NavigationSection: React.FC<{
           <Badge label={`Wi-Fi ${wifiStatus}${wifiAnchor ? ` • ${wifiAnchor.label}` : ''}`} />
           <Badge label={`Conf ${Math.round(wifiConfidence * 100)}%`} />
           <Badge label={`PDR ${pdrConfidence}`} />
+          <Badge label={`OS ${Platform.OS}`} />
         </View>
         <View style={styles.pdrRow}>
-          {wifiAnchorsConfig.map((anchor) => (
+          <Badge label={`DevMotion ${sensorLabel(sensorHealth.deviceMotion.available)} ${ageSec(sensorHealth.deviceMotion.lastAt)}`} />
+          <Badge
+            label={`Pedom ${sensorLabel(sensorHealth.pedometer.available)} ${ageSec(sensorHealth.pedometer.lastAt)}${
+              sensorHealth.pedometer.permission ? ` • ${sensorHealth.pedometer.permission}` : ''
+            }`}
+          />
+          <Badge label={`Mag ${sensorLabel(sensorHealth.mag.available)} ${ageSec(sensorHealth.mag.lastAt)}`} />
+          <Badge label={`Baro ${sensorLabel(sensorHealth.baro.available)} ${ageSec(sensorHealth.baro.lastAt)}`} />
+        </View>
+        <View style={styles.pdrRow}>
+          <Badge label={`Att ${pdrState.gyroHeading.toFixed(0)}°`} />
+          <Badge label={`Mag ${pdrState.magHeading.toFixed(0)}°`} />
+          <Badge label={`src ${motionDebug.stepSource}`} />
+          <Badge label={`ped ${motionDebug.pedometerSteps}`} />
+          <Badge label={`dev ${motionDebug.deviceSteps}`} />
+          <Badge label={`a ${motionDebug.accelMag.toFixed(2)}`} />
+          <Badge label={`base ${motionDebug.accelBaseline.toFixed(2)}`} />
+          <Badge
+            label={`diff ${motionDebug.accelDiff.toFixed(2)}`}
+            tone={motionDebug.accelDiff > motionDebug.stepThreshold ? 'accent' : 'muted'}
+          />
+          <Badge label={`th ${motionDebug.stepThreshold.toFixed(2)}`} />
+          <Badge label={`len ${motionDebug.stepLength.toFixed(2)}m`} />
+          <Badge label={cadencePerMin ? `cad ${cadencePerMin}/min` : 'cad —'} />
+          <Badge
+            label={stepPulse ? 'STEP' : lastStepAgoSec !== null ? `${lastStepAgoSec.toFixed(1)}s` : 'no step'}
+            tone={stepPulse ? 'success' : 'muted'}
+          />
+          <Badge label={motionDebug.isStationary ? 'Still' : 'Moving'} tone={motionDebug.isStationary ? 'muted' : 'success'} />
+        </View>
+        {sensorHealth.deviceMotion.error ||
+        sensorHealth.pedometer.error ||
+        sensorHealth.mag.error ||
+        sensorHealth.baro.error ? (
+          <Text style={styles.metaMuted}>
+            Sensor error:{' '}
+            {[
+              sensorHealth.deviceMotion.error,
+              sensorHealth.pedometer.error,
+              sensorHealth.mag.error,
+              sensorHealth.baro.error,
+            ]
+              .filter(Boolean)
+              .join(' | ')}
+          </Text>
+        ) : null}
+        <Text style={styles.metaMuted}>Step wenn diff &gt; th und Δt &gt; 250ms.</Text>
+        <View style={styles.pdrRow}>
+          {anchors.map((anchor) => (
             <Pressable key={anchor.bssid} style={styles.ghostButton} onPress={() => onMockAnchor(anchor)}>
               <Ionicons name="wifi" size={16} color={colors.accent} />
               <Text style={styles.metaText}>{anchor.label}</Text>
             </Pressable>
           ))}
+          {onScanWifi ? (
+            <Pressable key="wifi-auto" style={styles.ghostButton} onPress={onScanWifi}>
+              <Ionicons name="wifi" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Auto Wi-Fi</Text>
+            </Pressable>
+          ) : null}
           <Pressable
             style={styles.ghostButton}
             onPress={onRecenter}
@@ -1095,7 +1325,7 @@ const NavigationSection: React.FC<{
         </>
       )}
 
-      {!testMode && (
+      {!testMode && mapMode !== 'house' && (
         <View style={styles.glassCard}>
           <Text style={styles.sectionTitle}>Floorplan anpassen</Text>
           <Text style={styles.metaMuted}>Füge Gänge hinzu und platziere sie im Raster.</Text>
@@ -1129,14 +1359,14 @@ const NavigationSection: React.FC<{
             <View style={[styles.row, { gap: 8 }]}>
               <TextInput
                 style={[styles.searchInput, styles.floorInputSmall]}
-                placeholder="Row (0-5)"
+                placeholder={`Row (0-${gridSize - 1})`}
                 keyboardType="numeric"
                 value={form.row}
                 onChangeText={(v) => setForm({ row: v })}
               />
               <TextInput
                 style={[styles.searchInput, styles.floorInputSmall]}
-                placeholder="Col (0-5)"
+                placeholder={`Col (0-${gridSize - 1})`}
                 keyboardType="numeric"
                 value={form.col}
                 onChangeText={(v) => setForm({ col: v })}
@@ -1146,8 +1376,8 @@ const NavigationSection: React.FC<{
               <Pressable
                 style={styles.primaryButton}
                 onPress={() => {
-                  const r = Math.max(0, Math.min(5, Number(form.row) || 0));
-                  const c = Math.max(0, Math.min(5, Number(form.col) || 0));
+                  const r = Math.max(0, Math.min(gridSize - 1, Number(form.row) || 0));
+                  const c = Math.max(0, Math.min(gridSize - 1, Number(form.col) || 0));
                   addNode(form.label || 'Gang', form.section || 'custom', r, c);
                 }}
               >
@@ -1163,7 +1393,7 @@ const NavigationSection: React.FC<{
         </View>
       )}
 
-      {!testMode && (
+      {!testMode && mapMode !== 'house' && (
         <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={optimiseRoute}>
           <Ionicons name="navigate" size={18} color={colors.text} />
           <Text style={styles.primaryButtonText}>Route optimieren</Text>
@@ -1171,22 +1401,173 @@ const NavigationSection: React.FC<{
       )}
 
       <View style={styles.mapLegend}>
-        <Text style={styles.metaMuted}>Tippe auf einen Punkt, um den Start zu setzen.</Text>
+        <Text style={styles.metaMuted}>
+          {mapMode === 'house' ? 'Tippe auf den Plan, um den Start zu setzen.' : 'Tippe auf einen Punkt, um den Start zu setzen.'}
+        </Text>
         <Badge label={`Start: ${startNodeId}`} />
         {wifiAnchor ? <Badge label={`Anchor: ${wifiAnchor.label}`} tone="accent" /> : null}
       </View>
 
-      <FloorplanCanvas
-        nodes={[...baseFloorNodes, ...customNodes]}
-        routeOrder={routeOrder}
-        visited={visited}
-        startId={startNodeId}
-        onSelectNode={(node) => onSelectStart(node.id)}
-        path={pdrPath}
-        current={pdrPath[pdrPath.length - 1]}
-      />
+      {mapMode === 'house' ? (
+        <>
+          <View style={styles.listControlRow}>
+            <View style={styles.segment}>
+              {(['house', 'neue'] as const).map((id) => (
+                <Pressable
+                  key={id}
+                  style={[styles.segmentButton, planId === id && styles.segmentButtonActive]}
+                  onPress={() => onChangePlanId(id)}
+                >
+                  <Text style={[styles.metaText, planId === id && { color: colors.ink }]}>
+                    {id === 'house' ? 'House' : 'Neue'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+          <View style={styles.listControlRow}>
+            <View style={styles.segment}>
+              {(['start', 'measure', 'anchor'] as const).map((t) => (
+                <Pressable
+                  key={t}
+                  style={[styles.segmentButton, planTool === t && styles.segmentButtonActive]}
+                  onPress={() => setPlanTool(t)}
+                >
+                  <Text style={[styles.metaText, planTool === t && { color: colors.ink }]}>
+                    {t === 'start' ? 'Start' : t === 'measure' ? 'Measure' : 'Anchor'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {planTool !== 'start' ? (
+              <Pressable
+                style={styles.ghostButton}
+                onPress={() => {
+                  setPlanMeasureA(null);
+                  setPlanMeasureB(null);
+                }}
+              >
+                <Ionicons name="trash-outline" size={16} color={colors.muted} />
+                <Text style={styles.metaText}>Clear</Text>
+              </Pressable>
+            ) : null}
+          </View>
+          <View style={styles.planControls}>
+            <Text style={styles.metaText}>Scale</Text>
+            <TextInput
+              style={[styles.searchInput, styles.floorInputSmall]}
+              placeholder="img px / m"
+              keyboardType="numeric"
+              value={String(Math.round(planImagePixelsPerMeter))}
+              onChangeText={(v) => setPlanImagePixelsPerMeter(Number(v) || 1)}
+            />
+            {planId === 'neue' ? <Badge label="1:74" tone="accent" /> : null}
+            <Pressable
+              style={styles.ghostButton}
+              onPress={() => {
+                setPlanCalA(null);
+                setPlanCalB(null);
+                setPlanCalMeters('');
+                if (planDefaultImagePixelsPerMeter) {
+                  setPlanImagePixelsPerMeter(planDefaultImagePixelsPerMeter);
+                }
+              }}
+            >
+              <Ionicons name="close" size={16} color={colors.muted} />
+              <Text style={styles.metaText}>Reset</Text>
+            </Pressable>
+          </View>
+          {planTool === 'measure' && (planMeasureA || planMeasureB) ? (
+            <View style={styles.planControls}>
+              <Badge label={`A ${planMeasureA ? `${Math.round(planMeasureA.x)},${Math.round(planMeasureA.y)}` : '—'}`} />
+              <Badge label={`B ${planMeasureB ? `${Math.round(planMeasureB.x)},${Math.round(planMeasureB.y)}` : '—'}`} />
+              {planMeasureA && planMeasureB ? (
+                <Badge
+                  label={`Δ ${(Math.hypot(planMeasureB.x - planMeasureA.x, planMeasureB.y - planMeasureA.y) / Math.max(0.0001, planImagePixelsPerMeter)).toFixed(2)} m`}
+                  tone="accent"
+                />
+              ) : (
+                <Text style={styles.metaMuted}>Tap point {planMeasureA ? 'B' : 'A'}</Text>
+              )}
+            </View>
+          ) : null}
+          {planId === 'house' ? (
+            <>
+              <Text style={styles.metaMuted}>
+                Kalibrieren: Tippe 2 Punkte auf dem Plan, gib die reale Distanz (m) ein, dann „Apply“.
+              </Text>
+              <View style={styles.planControls}>
+                <Badge label={`A ${planCalA ? `${Math.round(planCalA.x)},${Math.round(planCalA.y)}` : '—'}`} />
+                <Badge label={`B ${planCalB ? `${Math.round(planCalB.x)},${Math.round(planCalB.y)}` : '—'}`} />
+                {planCalA && planCalB ? (
+                  <Badge
+                    label={`d ${(Math.hypot(planCalB.x - planCalA.x, planCalB.y - planCalA.y) / Math.max(1, planImagePixelsPerMeter)).toFixed(2)} m`}
+                    tone="accent"
+                  />
+                ) : null}
+                <TextInput
+                  style={[styles.searchInput, styles.floorInputSmall]}
+                  placeholder="meters"
+                  keyboardType="numeric"
+                  value={planCalMeters}
+                  onChangeText={setPlanCalMeters}
+                />
+                <Pressable
+                  style={styles.primaryButton}
+                  onPress={() => {
+                    if (!planCalA || !planCalB) return;
+                    const meters = Number(planCalMeters);
+                    if (!Number.isFinite(meters) || meters <= 0.01) return;
+                    const dPx = Math.hypot(planCalB.x - planCalA.x, planCalB.y - planCalA.y);
+                    const ppm = Math.max(1, dPx / meters);
+                    setPlanImagePixelsPerMeter(ppm);
+                  }}
+                >
+                  <Ionicons name="checkmark" size={18} color={colors.text} />
+                  <Text style={styles.primaryButtonText}>Apply</Text>
+                </Pressable>
+              </View>
+            </>
+          ) : (
+            <Text style={styles.metaMuted}>Scale ist hardcoded über 1:74 (PNG @ 72dpi).</Text>
+          )}
+          <FloorplanImageCanvas
+            source={planImage}
+            imagePixelsPerMeter={planImagePixelsPerMeter}
+            path={pdrPath}
+            current={pdrPath[pdrPath.length - 1]}
+            onTapMeters={(p, px) => {
+              if (planTool === 'measure') {
+                if (!planMeasureA) setPlanMeasureA(px);
+                else if (!planMeasureB) setPlanMeasureB(px);
+                else {
+                  setPlanMeasureA(px);
+                  setPlanMeasureB(null);
+                }
+                return;
+              }
+              if (planTool === 'anchor') {
+                onSetAnchorAt?.(p);
+                return;
+              }
+              onPlanTap(p, px);
+            }}
+          />
+        </>
+      ) : (
+        <FloorplanCanvas
+          nodes={[...storeMap.nodes, ...customNodes]}
+          gridSize={gridSize}
+          routeOrder={routeOrder}
+          visited={visited}
+          startId={startNodeId}
+          onSelectNode={(node) => onSelectStart(node.id)}
+          path={pdrPath}
+          current={pdrPath[pdrPath.length - 1]}
+        />
+      )}
 
-      {!testMode && (
+      {!testMode && mapMode !== 'house' && (
         <View style={styles.routeSteps}>
           {orderedSections.map((section, idx) => {
             const sectionItems = matched.filter((m) => m.section.id === section.id).map((m) => m.item.name);
@@ -1206,7 +1587,7 @@ const NavigationSection: React.FC<{
         </View>
       )}
 
-      {!testMode && (
+      {!testMode && mapMode !== 'house' && (
         <View style={styles.navCtaRow}>
           <View>
             <Text style={styles.sectionTitle}>Zeit sparen im Markt</Text>
@@ -1286,7 +1667,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('home');
   const [searchQuery, setSearchQuery] = useState('');
   const [suggestedRecipe, setSuggestedRecipe] = useState<Recipe | null>(null);
-  const [customNodes, setCustomNodes] = useState<FloorNode[]>([]);
+  const [customNodes, setCustomNodes] = useState<NavNode[]>([]);
   const [routeOrder, setRouteOrder] = useState<string[]>(['entry', 'exit']);
   const [floorForm, setFloorForm] = useState({ label: '', section: '', row: '0', col: '0' });
   const [aiPrompt, setAiPrompt] = useState('');
@@ -1297,35 +1678,128 @@ export default function App() {
   const [recent, setRecent] = useState<string[]>(['Milch', 'Brot', 'Eier']);
   const [activity, setActivity] = useState<string[]>(['Willkommen in deiner Liste.']);
   const [pdrActive, setPdrActive] = useState(false);
-  const [pdrState, setPdrState] = useState<PdrState>({ steps: 0, heading: 0, floor: 0, pressure: 0, status: 'idle' });
+  const [navMapMode, setNavMapMode] = useState<'pilot' | 'house'>('pilot');
+  const [planId, setPlanId] = useState<PlanId>('house');
+  const activePlan = useMemo(() => planConfigs[planId], [planId]);
+  const [planTool, setPlanTool] = useState<PlanTool>('start');
+  const [planMeasureA, setPlanMeasureA] = useState<{ x: number; y: number } | null>(null);
+  const [planMeasureB, setPlanMeasureB] = useState<{ x: number; y: number } | null>(null);
+  const [planAnchorsById, setPlanAnchorsById] = useState<Record<PlanId, StoreMapAnchor[]>>(() => ({
+    house: [
+      { bssid: '8c:19:b5:d8:b1:6d', label: 'Home Wi‑Fi', x: 1, y: 1, floor: 0, source: 'live', confidence: 0.9 },
+    ],
+    neue: [
+      { bssid: '8c:19:b5:d8:b1:6d', label: 'Home Wi‑Fi', x: 1, y: 1, floor: 0, source: 'live', confidence: 0.9 },
+    ],
+  }));
+  const activeStoreMap: StoreMap = useMemo(() => {
+    if (navMapMode !== 'house') return defaultStoreMap;
+    const anchors = planAnchorsById[planId] ?? [];
+    return { ...activePlan.map, anchors };
+  }, [navMapMode, activePlan, planAnchorsById, planId]);
+  const [planImagePixelsPerMeter, setPlanImagePixelsPerMeter] = useState(
+    activePlan.defaultImagePixelsPerMeter ?? 90,
+  );
+  const [planCalA, setPlanCalA] = useState<{ x: number; y: number } | null>(null);
+  const [planCalB, setPlanCalB] = useState<{ x: number; y: number } | null>(null);
+  const [planCalMeters, setPlanCalMeters] = useState('');
+  const [startOverride, setStartOverride] = useState<PdrPoint | null>(null);
+  const [pdrState, setPdrState] = useState<PdrState>({
+    steps: 0,
+    heading: 0,
+    gyroHeading: 0,
+    magHeading: 0,
+    floor: 0,
+    pressure: 0,
+    status: 'idle',
+  });
   const pdrBaseline = React.useRef<number | null>(null);
   const [startNodeId, setStartNodeId] = useState<string>('entry');
   const [pdrPath, setPdrPath] = useState<PdrPoint[]>([]);
   const headingRef = React.useRef(0);
   const magHeadingRef = React.useRef(0);
-  const lastStepsRef = React.useRef(0);
   const gyroHeadingRef = React.useRef(0);
-  const lastGyroTs = React.useRef<number | null>(null);
   const [pdrConfidence, setPdrConfidence] = useState<'good' | 'ok' | 'low'>('ok');
-  const accelBaseline = React.useRef(0);
-  const accelPeak = React.useRef(0);
   const lastStepTime = React.useRef<number>(0);
   const stepLengthRef = React.useRef(0.6);
+  const [motionDebug, setMotionDebug] = useState<MotionDebug>({
+    accelMag: 0,
+    accelBaseline: 0,
+    accelDiff: 0,
+    stepThreshold: 0.12,
+    stepLength: 0.6,
+    lastStepAt: null,
+    lastIntervalMs: 0,
+    isStationary: true,
+    stepSource: 'none',
+    deviceMotionLinAccMag: 0,
+    pedometerSteps: 0,
+    deviceSteps: 0,
+  });
+  const [sensorHealth, setSensorHealth] = useState<SensorHealth>({
+    accel: { available: null, lastAt: null },
+    gyro: { available: null, lastAt: null },
+    mag: { available: null, lastAt: null },
+    baro: { available: null, lastAt: null },
+    deviceMotion: { available: null, lastAt: null },
+    pedometer: { available: null, lastAt: null },
+  });
+  const sensorHealthRef = React.useRef<SensorHealth>(sensorHealth);
+  const motionDebugRef = React.useRef<MotionDebug>(motionDebug);
+  const lastDebugUpdateRef = React.useRef(0);
+  const stationarySinceRef = React.useRef<number | null>(null);
+  const lastIntervalRef = React.useRef(0);
+  const lastPedometerStepsRef = React.useRef<number | null>(null);
+  const deviceStepsRef = React.useRef(0);
+  const stepPeakRef = React.useRef<{ inPeak: boolean; max: number }>({ inPeak: false, max: 0 });
+  const linAccWindowRef = React.useRef<number[]>([]);
+  const gravityRef = React.useRef<{ x: number; y: number; z: number; init: boolean }>({ x: 0, y: 0, z: 0, init: false });
   const getStartCoord = React.useCallback((): PdrPoint => {
-    const all = [...baseFloorNodes, ...customNodes];
+    if (startOverride) return startOverride;
+    const all = [...activeStoreMap.nodes, ...customNodes];
     const node = all.find((n) => n.id === startNodeId) || all[0];
-    return { x: (node?.col ?? 0) + 0.5, y: (node?.row ?? 0) + 0.5 };
-  }, [startNodeId, customNodes]);
-  const [wifiAnchor, setWifiAnchor] = useState<WifiAnchor | null>(null);
+    return { x: node?.x ?? 0.5, y: node?.y ?? 0.5 };
+  }, [startOverride, startNodeId, activeStoreMap, customNodes]);
+  const [wifiAnchor, setWifiAnchor] = useState<StoreMapAnchor | null>(null);
   const [wifiStatus, setWifiStatus] = useState<'mock' | 'live' | 'off'>('mock');
   const [wifiConfidence, setWifiConfidence] = useState(0.7);
+  const scanWifiOnce = React.useCallback(async () => {
+    if (Platform.OS === 'web') {
+      setWifiStatus('off');
+      setWifiAnchor(null);
+      setWifiConfidence(0);
+      return;
+    }
+    const readings = await scanWifiReadings();
+    const anchors = activeStoreMap.anchors ?? [];
+    if (!readings.length || anchors.length === 0) {
+      setWifiStatus('off');
+      setWifiAnchor(null);
+      setWifiConfidence(0);
+      return;
+    }
+    const sorted = [...readings].sort((a, b) => b.level - a.level);
+    const matchReading = sorted.find((r) =>
+      anchors.some((a) => a.bssid.toLowerCase() === r.bssid.toLowerCase()),
+    );
+    if (!matchReading) {
+      setWifiStatus('off');
+      setWifiAnchor(null);
+      setWifiConfidence(0.2);
+      return;
+    }
+    const anchor = anchors.find((a) => a.bssid.toLowerCase() === matchReading.bssid.toLowerCase()) ?? null;
+    const conf = Math.min(1, Math.max(0.2, (matchReading.level + 100) / 70));
+    setWifiAnchor(anchor);
+    setWifiStatus('live');
+    setWifiConfidence(conf);
+  }, [activeStoreMap]);
   const recenterPdr = React.useCallback(() => {
-    const all = [...baseFloorNodes, ...customNodes];
+    const all = [...activeStoreMap.nodes, ...customNodes];
     const node = all.find((n) => n.id === startNodeId) || all[0];
-    setPdrPath([{ x: (node?.col ?? 0) + 0.5, y: (node?.row ?? 0) + 0.5 }]);
+    setPdrPath([{ x: node?.x ?? 0.5, y: node?.y ?? 0.5 }]);
     setPdrState((s) => ({ ...s, steps: 0 }));
-    lastStepsRef.current = 0;
-  }, [customNodes, startNodeId]);
+  }, [activeStoreMap, customNodes, startNodeId]);
 
   const pickRecipeFromPrompt = (prompt: string) => {
     const words = prompt
@@ -1408,10 +1882,16 @@ export default function App() {
 
   const addCustomNode = (label: string, sectionId: string, row: number, col: number) => {
     const id = `${sectionId || 'custom'}-${Date.now()}`;
-    // prevent overlap on same cell
-    const exists = customNodes.some((n) => n.row === row && n.col === col);
-    if (exists) return;
-    setCustomNodes((prev) => [...prev, { id, label, row, col, sectionId }]);
+    const occupied = [...activeStoreMap.nodes, ...customNodes].some(
+      (n) => Math.floor(n.y) === row && Math.floor(n.x) === col,
+    );
+    if (occupied) return;
+    const x = col + 0.5;
+    const y = row + 0.5;
+    setCustomNodes((prev) => [
+      ...prev,
+      { id, label, x, y, floor: 0, type: sectionId ? 'aisle' : 'poi', sectionId },
+    ]);
   };
 
   const clearCustomNodes = () => {
@@ -1421,6 +1901,7 @@ export default function App() {
   };
 
   const optimiseRoute = () => {
+    if (navMapMode === 'house') return;
     const pending = items.filter((i) => i.status === 'pending');
     const targets = pending
       .map((it) => {
@@ -1431,20 +1912,22 @@ export default function App() {
       })
       .filter(Boolean) as StoreSection[];
 
-    const nodeOrder: FloorNode[] = [];
+    const stopNodeIds: string[] = [];
     targets.forEach((section) => {
-      const matchNode =
+      const baseMatch = activeStoreMap.nodes.find((n) => n.sectionId === section.id);
+      const customMatch =
         customNodes.find((n) => n.sectionId === section.id) ||
         customNodes.find((n) => n.label.toLowerCase().includes(section.label.toLowerCase()));
-      if (matchNode && !nodeOrder.some((n) => n.id === matchNode.id)) {
-        nodeOrder.push(matchNode);
-      }
+      const node = baseMatch ?? customMatch;
+      if (node && !stopNodeIds.includes(node.id)) stopNodeIds.push(node.id);
     });
 
-    // simple sort: row then col for deterministic "fastest" placeholder
-    const sorted = nodeOrder.sort((a, b) => a.row - b.row || a.col - b.col).map((n) => n.id);
-    const start = nodeOrder.find((n) => n.id === startNodeId) || baseFloorNodes.find((n) => n.id === startNodeId) || baseFloorNodes[0];
-    setRouteOrder([start?.id || 'entry', ...sorted.filter((id) => id !== (start?.id || 'entry')), 'exit']);
+    const mapWithCustom: StoreMap = {
+      ...activeStoreMap,
+      nodes: [...activeStoreMap.nodes, ...customNodes],
+    };
+    const order = computeRouteOrder(mapWithCustom, startNodeId, stopNodeIds, 'exit');
+    setRouteOrder(computePolylineForOrder(mapWithCustom, order));
   };
 
   const removeItem = (id: string) => {
@@ -1494,107 +1977,339 @@ export default function App() {
   const offlineCopy = { title: t.offlineTitle, message: t.offlineMessage };
 
   React.useEffect(() => {
-    let gyroSub: any;
+    let devMotionSub: any;
     let magSub: any;
     let baroSub: any;
-    let accelSub: any;
+    let pedometerSub: any;
     const start = async () => {
       if (!pdrActive) return;
-      setPdrState((s) => ({ ...s, status: 'tracking', steps: 0 }));
-      lastStepsRef.current = 0;
+      setPdrState((s) => ({ ...s, status: 'tracking', steps: 0, heading: 0, gyroHeading: 0, magHeading: 0 }));
       setPdrPath([getStartCoord()]);
       headingRef.current = 0;
       gyroHeadingRef.current = 0;
       magHeadingRef.current = 0;
-      lastGyroTs.current = null;
+      lastStepTime.current = 0;
+      lastIntervalRef.current = 0;
+      stationarySinceRef.current = null;
+      lastDebugUpdateRef.current = 0;
+      lastPedometerStepsRef.current = null;
+      deviceStepsRef.current = 0;
+      stepPeakRef.current = { inPeak: false, max: 0 };
+      linAccWindowRef.current = [];
+      gravityRef.current = { x: 0, y: 0, z: 0, init: false };
+      sensorHealthRef.current = {
+        accel: { available: null, lastAt: null },
+        gyro: { available: null, lastAt: null },
+        mag: { available: null, lastAt: null },
+        baro: { available: null, lastAt: null },
+        deviceMotion: { available: null, lastAt: null },
+        pedometer: { available: null, lastAt: null },
+      };
+      setSensorHealth(sensorHealthRef.current);
+      const initialDebug: MotionDebug = {
+        accelMag: 0,
+        accelBaseline: 0,
+        accelDiff: 0,
+        stepThreshold: 0.12,
+        stepLength: 0.6,
+        lastStepAt: null,
+        lastIntervalMs: 0,
+        isStationary: true,
+        stepSource: 'none',
+        deviceMotionLinAccMag: 0,
+        pedometerSteps: 0,
+        deviceSteps: 0,
+      };
+      motionDebugRef.current = initialDebug;
+      setMotionDebug(initialDebug);
+
+      const updateSensorHealth = (patch: Partial<SensorHealth>) => {
+        sensorHealthRef.current = { ...sensorHealthRef.current, ...patch };
+        setSensorHealth(sensorHealthRef.current);
+      };
+
+      const [devOk, magOk, baroOk, pedOk] = await Promise.all([
+        DeviceMotion.isAvailableAsync().catch(() => false),
+        Magnetometer.isAvailableAsync().catch(() => false),
+        Barometer.isAvailableAsync().catch(() => false),
+        Pedometer.isAvailableAsync().catch(() => false),
+      ]);
+      updateSensorHealth({
+        accel: { ...sensorHealthRef.current.accel, available: null },
+        gyro: { ...sensorHealthRef.current.gyro, available: null },
+        mag: { ...sensorHealthRef.current.mag, available: magOk },
+        baro: { ...sensorHealthRef.current.baro, available: baroOk },
+        deviceMotion: { ...sensorHealthRef.current.deviceMotion, available: devOk },
+        pedometer: { ...sensorHealthRef.current.pedometer, available: pedOk },
+      });
 
       // Magnetometer: heavily smoothed, only used as a slow corrector
-      magSub = Magnetometer.addListener(({ x, y }) => {
-        const angle = Math.atan2(y, x) * (180 / Math.PI);
-        const heading = wrapHeading(angle);
-        const diff = headingDiff(heading, magHeadingRef.current);
-        const factor = Math.abs(diff) < 30 ? 0.12 : 0.04;
-        magHeadingRef.current = wrapHeading(magHeadingRef.current + diff * factor);
-      });
-      Magnetometer.setUpdateInterval(200);
-
-      // Heading: gyro integration + complementary blend with mag
-      gyroSub = Gyroscope.addListener(({ z, timestamp }) => {
-        const ts = timestamp || Date.now();
-        if (lastGyroTs.current) {
-          const dt = (ts - lastGyroTs.current) / 1000;
-          gyroHeadingRef.current = wrapHeading(gyroHeadingRef.current + (z || 0) * (180 / Math.PI) * dt);
-        }
-        lastGyroTs.current = ts;
-        const fused = wrapHeading(gyroHeadingRef.current * 0.96 + magHeadingRef.current * 0.04);
-        const delta = headingDiff(fused, headingRef.current);
-        const limited = Math.max(-5, Math.min(5, delta));
-        headingRef.current = wrapHeading(headingRef.current + limited);
-        setPdrState((s) => ({ ...s, heading: headingRef.current }));
-      });
-      Gyroscope.setUpdateInterval(100);
-
-      accelSub = Accelerometer.addListener(({ x, y, z, timestamp }) => {
-        const ts = timestamp || Date.now();
-        const mag = Math.sqrt((x || 0) ** 2 + (y || 0) ** 2 + (z || 0) ** 2);
-        if (!accelBaseline.current) accelBaseline.current = mag;
-        accelBaseline.current = accelBaseline.current * 0.95 + mag * 0.05; // slow drift
-        const diff = Math.abs(mag - accelBaseline.current);
-        accelPeak.current = Math.max(accelPeak.current * 0.9, diff);
-        const threshold = Math.max(0.12, accelBaseline.current * 0.015);
-        const now = ts;
-        const minInterval = 250; // ms
-        if (diff > threshold && now - lastStepTime.current > minInterval) {
-          lastStepTime.current = now;
-          const stepLen = Math.max(0.45, Math.min(1.0, 0.6 + diff * 0.05));
-          stepLengthRef.current = stepLen;
-          const hRad = (headingRef.current * Math.PI) / 180;
-          setPdrPath((prev) => {
-            const coords: PdrPoint[] = [...prev];
-            const current = coords[coords.length - 1] || getStartCoord();
-            let x = current.x + Math.sin(hRad) * stepLen;
-            let y = current.y - Math.cos(hRad) * stepLen;
-            x = Math.max(0, Math.min(6, x));
-            y = Math.max(0, Math.min(6, y));
-            coords.push({ x, y });
-            return coords.slice(-200);
+      if (magOk) {
+        try {
+          Magnetometer.setUpdateInterval(200);
+          magSub = Magnetometer.addListener(({ x, y }) => {
+            sensorHealthRef.current = {
+              ...sensorHealthRef.current,
+              mag: { ...sensorHealthRef.current.mag, lastAt: Date.now() },
+            };
+            const angle = Math.atan2(y, x) * (180 / Math.PI);
+            const heading = wrapHeading(angle);
+            const diff = headingDiff(heading, magHeadingRef.current);
+            const factor = Math.abs(diff) < 30 ? 0.12 : 0.04;
+            magHeadingRef.current = wrapHeading(magHeadingRef.current + diff * factor);
           });
-          setPdrState((s) => ({ ...s, steps: s.steps + 1 }));
+        } catch (e: any) {
+          updateSensorHealth({
+            mag: {
+              ...sensorHealthRef.current.mag,
+              available: false,
+              error: String(e?.message || e),
+            },
+          });
         }
-        // confidence heuristic
-        const headingVar = Math.abs(headingDiff(gyroHeadingRef.current, headingRef.current));
-        const quality = headingVar < 10 && diff > threshold ? 'good' : headingVar < 25 ? 'ok' : 'low';
-        setPdrConfidence(quality as 'good' | 'ok' | 'low');
-      });
-      Accelerometer.setUpdateInterval(60);
+      }
 
-      baroSub = Barometer.addListener(({ pressure }) => {
-        if (pdrBaseline.current === null) {
-          pdrBaseline.current = pressure;
+      const toDeg = (v: number) => (Math.abs(v) <= Math.PI * 2 + 0.5 ? (v * 180) / Math.PI : v);
+
+	      const applyStep = (source: MotionDebug['stepSource'], stepsDelta: number, now: number) => {
+	        if (stepsDelta <= 0) return;
+	        const stepLen = stepLengthRef.current;
+	        const hRad = (headingRef.current * Math.PI) / 180;
+	        const clampMax = activeStoreMap.gridSize;
+	        setPdrPath((prev) => {
+	          const coords: PdrPoint[] = [...prev];
+	          let cur = coords[coords.length - 1] || getStartCoord();
+	          for (let i = 0; i < Math.min(stepsDelta, 20); i += 1) {
+	            let nx = cur.x + Math.sin(hRad) * stepLen;
+	            let ny = cur.y - Math.cos(hRad) * stepLen;
+	            if (navMapMode === 'pilot') {
+	              nx = Math.max(0, Math.min(clampMax, nx));
+	              ny = Math.max(0, Math.min(clampMax, ny));
+	            }
+	            cur = { x: nx, y: ny };
+	            coords.push(cur);
+	          }
+	          return coords.slice(-200);
+	        });
+        setPdrState((s) => ({ ...s, steps: s.steps + stepsDelta }));
+        const nextDebug = { ...motionDebugRef.current, stepSource: source, lastStepAt: now };
+        motionDebugRef.current = nextDebug;
+        setMotionDebug(nextDebug);
+      };
+
+      // DeviceMotion: primary for step detection and heading stability
+      if (devOk) {
+        try {
+          DeviceMotion.setUpdateInterval(50);
+          devMotionSub = DeviceMotion.addListener((m) => {
+            const now = Date.now();
+            sensorHealthRef.current = {
+              ...sensorHealthRef.current,
+              deviceMotion: { ...sensorHealthRef.current.deviceMotion, lastAt: now },
+            };
+
+            const rot = m.rotation;
+            const alphaDeg = rot ? wrapHeading(toDeg(rot.alpha)) : headingRef.current;
+            gyroHeadingRef.current = alphaDeg;
+            // Fuse OS attitude yaw with magnetic heading (small correction)
+            const mag = magHeadingRef.current;
+            const fused = wrapHeading(alphaDeg * 0.97 + mag * 0.03);
+            const delta = headingDiff(fused, headingRef.current);
+            headingRef.current = wrapHeading(headingRef.current + Math.max(-8, Math.min(8, delta)));
+            setPdrState((s) => ({ ...s, heading: headingRef.current, gyroHeading: alphaDeg, magHeading: magHeadingRef.current }));
+
+            // Prefer native linear acceleration, fallback to high-pass filter on accelIncludingGravity.
+            const lin = m.acceleration;
+            const incl = m.accelerationIncludingGravity;
+            let ax = 0;
+            let ay = 0;
+            let az = 0;
+            if (lin) {
+              ax = lin.x;
+              ay = lin.y;
+              az = lin.z;
+            } else if (incl) {
+              const g = gravityRef.current;
+              if (!g.init) {
+                gravityRef.current = { x: incl.x, y: incl.y, z: incl.z, init: true };
+              } else {
+                const a = 0.92;
+                gravityRef.current = {
+                  x: g.x * a + incl.x * (1 - a),
+                  y: g.y * a + incl.y * (1 - a),
+                  z: g.z * a + incl.z * (1 - a),
+                  init: true,
+                };
+              }
+              const gg = gravityRef.current;
+              ax = incl.x - gg.x;
+              ay = incl.y - gg.y;
+              az = incl.z - gg.z;
+            }
+            const linMag = Math.hypot(ax, ay, az);
+            linAccWindowRef.current.push(linMag);
+            if (linAccWindowRef.current.length > 35) linAccWindowRef.current.shift();
+            const w = linAccWindowRef.current;
+            const mean = w.reduce((a, b) => a + b, 0) / (w.length || 1);
+            const variance =
+              w.reduce((acc, v) => acc + (v - mean) * (v - mean), 0) / Math.max(1, w.length - 1);
+            const std = Math.sqrt(variance);
+            const threshold = Math.max(0.35, mean + std * 2.2);
+            const low = linMag < 0.18;
+            if (low) {
+              if (stationarySinceRef.current === null) stationarySinceRef.current = now;
+            } else {
+              stationarySinceRef.current = null;
+            }
+            const isStationary = stationarySinceRef.current !== null && now - stationarySinceRef.current > 600;
+
+            // simple peak detector
+            const peak = stepPeakRef.current;
+            if (!peak.inPeak) {
+              if (linMag > threshold) {
+                peak.inPeak = true;
+                peak.max = linMag;
+              }
+            } else {
+              peak.max = Math.max(peak.max, linMag);
+              if (linMag < mean) {
+                peak.inPeak = false;
+                const minInterval = 280;
+                if (now - lastStepTime.current > minInterval && peak.max > threshold && !isStationary) {
+                  lastIntervalRef.current = lastStepTime.current ? now - lastStepTime.current : 0;
+                  lastStepTime.current = now;
+                  const stepLen = Math.max(0.45, Math.min(1.05, 0.62 + (peak.max - threshold) * 0.18));
+                  stepLengthRef.current = stepLen;
+                  deviceStepsRef.current += 1;
+                  applyStep('deviceMotion', 1, now);
+                }
+              }
+            }
+
+            const nextDebug: MotionDebug = {
+              ...motionDebugRef.current,
+              accelMag: linMag,
+              accelBaseline: mean,
+              accelDiff: Math.max(0, linMag - mean),
+              stepThreshold: threshold,
+              stepLength: stepLengthRef.current,
+              lastIntervalMs: lastIntervalRef.current,
+              isStationary,
+              deviceMotionLinAccMag: linMag,
+              pedometerSteps: motionDebugRef.current.pedometerSteps,
+              deviceSteps: deviceStepsRef.current,
+            };
+            motionDebugRef.current = nextDebug;
+            if (now - lastDebugUpdateRef.current > 150) {
+              lastDebugUpdateRef.current = now;
+              setMotionDebug(nextDebug);
+              setSensorHealth(sensorHealthRef.current);
+            }
+          });
+        } catch (e: any) {
+          updateSensorHealth({
+            deviceMotion: {
+              ...sensorHealthRef.current.deviceMotion,
+              available: false,
+              error: String(e?.message || e),
+            },
+          });
         }
-        const delta = (pdrBaseline.current ?? pressure) - pressure;
-        const approxMeters = delta * 8.3; // rough meters per hPa
-        const floor = Math.round(approxMeters / 3);
-        setPdrState((s) => ({ ...s, pressure, floor }));
-      });
+      }
+
+      // Pedometer: robust fallback for steps (especially iOS)
+      if (pedOk) {
+        try {
+          const perm = await Pedometer.getPermissionsAsync().catch(() => null);
+          if (perm && !perm.granted && perm.canAskAgain) {
+            await Pedometer.requestPermissionsAsync().catch(() => null);
+          }
+          const perm2 = await Pedometer.getPermissionsAsync().catch(() => null);
+          updateSensorHealth({
+            pedometer: {
+              ...sensorHealthRef.current.pedometer,
+              available: true,
+              permission: perm2 ? String(perm2.status) : undefined,
+            },
+          });
+          pedometerSub = Pedometer.watchStepCount(({ steps }) => {
+            const now = Date.now();
+            sensorHealthRef.current = {
+              ...sensorHealthRef.current,
+              pedometer: { ...sensorHealthRef.current.pedometer, lastAt: now },
+            };
+            const prev = lastPedometerStepsRef.current;
+            lastPedometerStepsRef.current = steps;
+            const delta = prev === null ? 0 : steps - prev;
+            if (delta > 0) {
+              applyStep('pedometer', delta, now);
+            }
+            const nextDebug = {
+              ...motionDebugRef.current,
+              pedometerSteps: steps,
+            };
+            motionDebugRef.current = nextDebug;
+            setMotionDebug(nextDebug);
+            setSensorHealth(sensorHealthRef.current);
+          });
+        } catch (e: any) {
+          updateSensorHealth({
+            pedometer: {
+              ...sensorHealthRef.current.pedometer,
+              available: false,
+              error: String(e?.message || e),
+            },
+          });
+        }
+      }
+
+      if (baroOk) {
+        try {
+          baroSub = Barometer.addListener(({ pressure }) => {
+            sensorHealthRef.current = {
+              ...sensorHealthRef.current,
+              baro: { ...sensorHealthRef.current.baro, lastAt: Date.now() },
+            };
+            if (pdrBaseline.current === null) {
+              pdrBaseline.current = pressure;
+            }
+            const delta = (pdrBaseline.current ?? pressure) - pressure;
+            const approxMeters = delta * 8.3; // rough meters per hPa
+            const floor = Math.round(approxMeters / 3);
+            setPdrState((s) => ({ ...s, pressure, floor }));
+          });
+        } catch (e: any) {
+          updateSensorHealth({
+            baro: {
+              ...sensorHealthRef.current.baro,
+              available: false,
+              error: String(e?.message || e),
+            },
+          });
+        }
+      }
+
+      if (!devOk && !magOk && !baroOk && !pedOk) {
+        setPdrState((s) => ({ ...s, status: 'denied' }));
+      }
+      setPdrConfidence(devOk ? (magOk ? 'good' : 'ok') : pedOk ? 'ok' : 'low');
     };
 
     const stop = () => {
-      gyroSub?.remove?.();
+      devMotionSub?.remove?.();
       magSub?.remove?.();
       baroSub?.remove?.();
-      accelSub?.remove?.();
+      pedometerSub?.remove?.();
     };
 
     start();
     return () => stop();
-  }, [pdrActive]);
+  }, [pdrActive, navMapMode, activeStoreMap, getStartCoord]);
 
   React.useEffect(() => {
     if (!pdrActive) {
       pdrBaseline.current = null;
       setPdrState((s) => ({ ...s, status: 'idle' }));
-      lastStepsRef.current = 0;
     }
   }, [pdrActive]);
 
@@ -1604,7 +2319,7 @@ export default function App() {
 
   React.useEffect(() => {
     if (!pdrActive || !wifiAnchor) return;
-    const anchorCoord: PdrPoint = { x: wifiAnchor.col + 0.5, y: wifiAnchor.row + 0.5 };
+    const anchorCoord: PdrPoint = { x: wifiAnchor.x, y: wifiAnchor.y };
     const conf = wifiConfidence || wifiAnchor.confidence || 0.7;
     setPdrPath((prev) => {
       const current = prev[prev.length - 1] || anchorCoord;
@@ -1723,6 +2438,7 @@ export default function App() {
 
           {activeTab === 'nav' ? (
             <NavigationSection
+              storeMap={activeStoreMap}
               items={items}
               customNodes={customNodes}
               addNode={addCustomNode}
@@ -1738,18 +2454,20 @@ export default function App() {
               startNodeId={startNodeId}
               onSelectStart={(id) => {
                 setStartNodeId(id);
-                const exists = [...baseFloorNodes, ...customNodes].some((n) => n.id === id);
+                const exists = [...activeStoreMap.nodes, ...customNodes].some((n) => n.id === id);
                 if (exists) {
                   setRouteOrder((prev) => [id, ...prev.filter((p) => p !== id && p !== 'entry'), 'exit']);
                 }
-                const all = [...baseFloorNodes, ...customNodes];
+                const all = [...activeStoreMap.nodes, ...customNodes];
                 const node = all.find((n) => n.id === id);
                 if (node) {
-                  setPdrPath([{ x: node.col + 0.5, y: node.row + 0.5 }]);
-                  lastStepsRef.current = 0;
+                  setStartOverride({ x: node.x, y: node.y });
+                  setPdrPath([{ x: node.x, y: node.y }]);
                 }
               }}
               pdrPath={pdrPath}
+              motionDebug={motionDebug}
+              sensorHealth={sensorHealth}
               wifiAnchor={wifiAnchor}
               wifiStatus={wifiStatus}
               wifiConfidence={wifiConfidence}
@@ -1758,9 +2476,78 @@ export default function App() {
                 setWifiStatus('mock');
                 setWifiConfidence(anchor.confidence ?? 0.7);
               }}
+              onScanWifi={scanWifiOnce}
               pdrConfidence={pdrConfidence}
               onRecenter={recenterPdr}
-              testMode
+              mapMode={navMapMode}
+              onChangeMapMode={(m) => {
+                setNavMapMode(m);
+                setStartOverride(null);
+                setPdrPath([getStartCoord()]);
+                setWifiAnchor(null);
+                setWifiStatus('off');
+                setWifiConfidence(0);
+                setPlanCalA(null);
+                setPlanCalB(null);
+                setPlanCalMeters('');
+                setPlanTool('start');
+                setPlanMeasureA(null);
+                setPlanMeasureB(null);
+              }}
+              planId={planId}
+              onChangePlanId={(id) => {
+                setPlanId(id);
+                setPlanCalA(null);
+                setPlanCalB(null);
+                setPlanCalMeters('');
+                setStartOverride(null);
+                setPdrPath([getStartCoord()]);
+                const preset = planConfigs[id].defaultImagePixelsPerMeter;
+                if (preset) setPlanImagePixelsPerMeter(preset);
+                setPlanTool('start');
+                setPlanMeasureA(null);
+                setPlanMeasureB(null);
+              }}
+              planImage={activePlan.image}
+              planImagePixelsPerMeter={planImagePixelsPerMeter}
+              setPlanImagePixelsPerMeter={(n) => setPlanImagePixelsPerMeter(Math.max(1, Math.min(600, n)))}
+              planDefaultImagePixelsPerMeter={activePlan.defaultImagePixelsPerMeter}
+              planTool={planTool}
+              setPlanTool={setPlanTool}
+              planMeasureA={planMeasureA}
+              planMeasureB={planMeasureB}
+              setPlanMeasureA={setPlanMeasureA}
+              setPlanMeasureB={setPlanMeasureB}
+              onSetAnchorAt={(pMeters) => {
+                setPlanAnchorsById((prev) => {
+                  const existing = prev[planId] ?? [];
+                  const updated =
+                    existing.length > 0
+                      ? [{ ...existing[0], x: pMeters.x, y: pMeters.y, floor: 0 }, ...existing.slice(1)]
+                      : [{ bssid: '8c:19:b5:d8:b1:6d', label: 'Home Wi‑Fi', x: pMeters.x, y: pMeters.y, floor: 0, source: 'live', confidence: 0.9 }];
+                  return { ...prev, [planId]: updated };
+                });
+              }}
+              planCalA={planCalA}
+              planCalB={planCalB}
+              setPlanCalA={setPlanCalA}
+              setPlanCalB={setPlanCalB}
+              planCalMeters={planCalMeters}
+              setPlanCalMeters={setPlanCalMeters}
+              onPlanTap={(pMeters, pPx) => {
+                if (planId === 'house') {
+                  if (!planCalA) {
+                    setPlanCalA(pPx);
+                    return;
+                  }
+                  if (!planCalB) {
+                    setPlanCalB(pPx);
+                    return;
+                  }
+                }
+                setStartOverride(pMeters);
+                setPdrPath([pMeters]);
+              }}
             />
           ) : null}
 
@@ -2464,4 +3251,26 @@ const styles = StyleSheet.create({
   tabItem: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   tabLabel: { color: colors.muted, marginTop: 4, fontSize: 12, fontFamily: 'Manrope_600SemiBold' },
   tabIndicator: { marginTop: 6, height: 3, width: 28, borderRadius: 999, backgroundColor: colors.accent },
+  planControls: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 },
+  planWrap: {
+    marginTop: 10,
+    height: 420,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: 'hidden',
+    backgroundColor: '#FFF9F3',
+  },
+  planImage: { width: '100%', height: '100%' },
+  planOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  planPathDot: { position: 'absolute', width: 4, height: 4, borderRadius: 2, backgroundColor: 'rgba(217,118,82,0.55)' },
+  planCurrentDot: {
+    position: 'absolute',
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: colors.accent,
+    borderWidth: 2,
+    borderColor: '#fff',
+  },
 });

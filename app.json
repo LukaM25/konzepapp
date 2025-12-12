@@ -16,8 +16,7 @@
       "supportsTablet": true,
       "infoPlist": {
         "NSMotionUsageDescription": "Wir nutzen Bewegungssensoren, um indoor Navigation und Schrittzählung zu ermöglichen.",
-        "NSLocationWhenInUseUsageDescription": "Optional für genauere Indoor-Position und Navigationsanker.",
-        
+        "NSLocationWhenInUseUsageDescription": "Optional für genauere Indoor-Position und Navigationsanker."
       }
     },
     "android": {
