@@ -13,6 +13,7 @@ import {
   Manrope_600SemiBold,
   Manrope_700Bold,
 } from '@expo-google-fonts/manrope';
+import { Accelerometer, Barometer, Gyroscope, Magnetometer } from 'expo-sensors';
 
 type HouseholdRole = 'owner' | 'editor' | 'viewer';
 type HouseholdMember = {
@@ -60,6 +61,24 @@ type Locale = 'de' | 'en';
 type TabId = 'home' | 'list' | 'recipes' | 'nav' | 'plans';
 type SortMode = 'category' | 'aisle' | 'priority';
 type FloorNode = { id: string; row: number; col: number; label: string; sectionId?: string };
+type PdrState = {
+  steps: number;
+  heading: number;
+  floor: number;
+  pressure: number;
+  status: 'idle' | 'tracking' | 'denied';
+};
+type WifiAnchor = { bssid: string; label: string; row: number; col: number; source: 'mock' | 'live'; confidence?: number };
+type PdrPoint = { x: number; y: number };
+
+const wrapHeading = (deg: number) => {
+  const h = deg % 360;
+  return h < 0 ? h + 360 : h;
+};
+const headingDiff = (a: number, b: number) => {
+  const d = ((a - b + 540) % 360) - 180;
+  return d;
+};
 
 const tabs: { id: TabId; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
   { id: 'home', label: 'Home', icon: 'home-outline' },
@@ -67,6 +86,11 @@ const tabs: { id: TabId; label: string; icon: keyof typeof Ionicons.glyphMap }[]
   { id: 'recipes', label: 'Rezepte', icon: 'restaurant-outline' },
   { id: 'nav', label: 'Navigation', icon: 'map-outline' },
   { id: 'plans', label: 'Pläne', icon: 'card-outline' },
+];
+
+const wifiAnchorsConfig: WifiAnchor[] = [
+  { bssid: 'AA:BB:CC:DD:EE:01', label: 'Router', row: 0, col: 0, source: 'mock', confidence: 0.85 },
+  { bssid: 'AA:BB:CC:DD:EE:02', label: 'AP', row: 5, col: 5, source: 'mock', confidence: 0.7 },
 ];
 
 const colors = {
@@ -284,12 +308,17 @@ const RecipeCard: React.FC<{
   </Pressable>
 );
 
-const FloorplanCanvas: React.FC<{ nodes: FloorNode[]; routeOrder: string[]; visited: string[]; gridSize?: number }> = ({
-  nodes,
-  routeOrder,
-  visited,
-  gridSize = 6,
-}) => {
+const FloorplanCanvas: React.FC<{
+  nodes: FloorNode[];
+  routeOrder: string[];
+  visited: string[];
+  gridSize?: number;
+  startId?: string;
+  onSelectNode?: (node: FloorNode) => void;
+  path?: PdrPoint[];
+  current?: PdrPoint;
+}> = ({ nodes, routeOrder, visited, gridSize = 6, startId, onSelectNode, path = [], current }) => {
+  const [cellSize, setCellSize] = React.useState(0);
   const cells = Array.from({ length: gridSize }, (_, row) =>
     Array.from({ length: gridSize }, (_, col) => {
       const node = nodes.find((n) => n.row === row && n.col === col);
@@ -297,33 +326,100 @@ const FloorplanCanvas: React.FC<{ nodes: FloorNode[]; routeOrder: string[]; visi
       const isVisited = node ? visited.includes(node.id) : false;
       const isEntry = node?.id === 'entry';
       const isExit = node?.id === 'exit';
-      return { node, isRoute, isVisited, isEntry, isExit };
+      const isStart = node?.id === startId;
+      const isPath = path.some((p) => Math.floor(p.y) === row && Math.floor(p.x) === col);
+      const isCurrent = current ? Math.floor(current.y) === row && Math.floor(current.x) === col : false;
+      return { node, isRoute, isVisited, isEntry, isExit, isStart, isPath, isCurrent };
     }),
   );
 
   return (
-    <View style={styles.floorGrid}>
+    <View
+      style={styles.floorGrid}
+      onLayout={(e) => {
+        const w = e.nativeEvent.layout.width;
+        setCellSize(w / gridSize);
+      }}
+    >
+      {cellSize > 0 ? (
+        <View style={styles.floorOverlay} pointerEvents="none">
+          {path.map((p, idx) => {
+            if (idx === path.length - 1) return null;
+            const next = path[idx + 1];
+            const x1 = p.x * cellSize;
+            const y1 = p.y * cellSize;
+            const x2 = next.x * cellSize;
+            const y2 = next.y * cellSize;
+            const dx = x2 - x1;
+            const dy = y2 - y1;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const angle = Math.atan2(dy, dx);
+            return (
+              <React.Fragment key={`${p.x}-${p.y}-${idx}`}>
+                <View
+                  style={[
+                    styles.floorPathLine,
+                    {
+                      width: dist,
+                      left: x1,
+                      top: y1,
+                      transform: [{ translateX: -dist / 2 }, { rotate: `${angle}rad` }],
+                    },
+                  ]}
+                />
+                <View style={[styles.floorPathDot, { left: x1 - 4, top: y1 - 4 }]} />
+              </React.Fragment>
+            );
+          })}
+          {current ? (
+            <View
+              style={[
+                styles.floorCurrentDot,
+                {
+                  left: current.x * cellSize - 8,
+                  top: current.y * cellSize - 8,
+                },
+              ]}
+            />
+          ) : null}
+        </View>
+      ) : null}
       {cells.map((row, rIdx) => (
         <View key={rIdx} style={styles.floorRow}>
           {row.map((cell, cIdx) => {
-            const bg = cell.isVisited
+            const bg = cell.isCurrent
+              ? colors.accent
+              : cell.isVisited
               ? '#DCEEE1'
-              : cell.isRoute
+              : cell.isPath
               ? colors.accentSoft
+              : cell.isRoute
+              ? 'rgba(217,118,82,0.18)'
               : cell.node
               ? '#FFF7ED'
               : '#E9DFD6';
             return (
-              <View key={`${rIdx}-${cIdx}`} style={[styles.floorCell, { backgroundColor: bg }]}>
+              <Pressable
+                key={`${rIdx}-${cIdx}`}
+                style={[styles.floorCell, { backgroundColor: bg }]}
+                disabled={!cell.node}
+                onPress={() => cell.node && onSelectNode?.(cell.node)}
+              >
                 {cell.node ? (
                   <View style={styles.floorNode}>
                     <Text style={styles.floorNodeIcon}>
-                      {cell.isEntry ? '🟢' : cell.isExit ? '🏁' : storeSections.find((s) => s.id === cell.node?.sectionId)?.icon || '📍'}
+                      {cell.isStart
+                        ? '⭐'
+                        : cell.isEntry
+                        ? '🟢'
+                        : cell.isExit
+                        ? '🏁'
+                        : storeSections.find((s) => s.id === cell.node?.sectionId)?.icon || '📍'}
                     </Text>
                     <Text style={styles.floorNodeLabel}>{cell.node.label}</Text>
                   </View>
                 ) : null}
-              </View>
+              </Pressable>
             );
           })}
         </View>
@@ -567,7 +663,10 @@ const ListSection: React.FC<{
       <View style={styles.listHeader}>
         <Badge label="WG / Familie" tone="accent" />
         <View style={styles.listActions}>
-          <Pressable style={styles.addButton} onPress={() => addItem('Bananen', 'wir', 'Obst')}>
+          <Pressable
+            style={styles.addButton}
+            onPress={() => addItem('Bananen', 'wir', 'Obst')}
+          >
             <Ionicons name="add" size={18} color="#fff" />
             <Text style={styles.addText}>Hinzufügen</Text>
           </Pressable>
@@ -651,7 +750,7 @@ const ListSection: React.FC<{
         </View>
       ) : null}
 
-      {grouped.map(([category, groupedItems]) => {
+      {grouped.map(([category, groupedItems], idxCategory) => {
         const section = storeSections.find(
           (s) => s.label.toLowerCase() === category.toLowerCase() || s.id.toLowerCase() === category.toLowerCase(),
         );
@@ -664,7 +763,7 @@ const ListSection: React.FC<{
               </View>
               <Badge label={`${groupedItems.length} Artikel`} tone="accent" />
             </View>
-            {groupedItems.map((item) => {
+            {groupedItems.map((item, idxItem) => {
               const assignee = presence.find((p) => p.id === item.assignedTo);
               const compact = density === 'compact';
               return (
@@ -681,7 +780,9 @@ const ListSection: React.FC<{
                     </Pressable>
                   )}
                 >
-                  <View style={[styles.listItem, compact && styles.listItemCompact]}>
+                  <View
+                    style={[styles.listItem, compact && styles.listItemCompact]}
+                  >
                     <View style={styles.itemLeft}>
                       <Ionicons
                         name={item.status === 'done' ? 'checkmark-circle' : 'ellipse-outline'}
@@ -841,7 +942,43 @@ const NavigationSection: React.FC<{
   visited: string[];
   form: { label: string; section: string; row: string; col: string };
   setForm: (f: Partial<{ label: string; section: string; row: string; col: string }>) => void;
-}> = ({ items, customNodes, addNode, clearNodes, optimiseRoute, routeOrder, visited, form, setForm }) => {
+  pdrState: PdrState;
+  pdrActive: boolean;
+  togglePdr: () => void;
+  startNodeId: string;
+  onSelectStart: (id: string) => void;
+  pdrPath: PdrPoint[];
+  wifiAnchor: WifiAnchor | null;
+  wifiStatus: 'mock' | 'live' | 'off';
+  onMockAnchor: (anchor: WifiAnchor) => void;
+  wifiConfidence: number;
+  testMode: boolean;
+  pdrConfidence: 'good' | 'ok' | 'low';
+  onRecenter: () => void;
+}> = ({
+  items,
+  customNodes,
+  addNode,
+  clearNodes,
+  optimiseRoute,
+  routeOrder,
+  visited,
+  form,
+  setForm,
+  pdrState,
+  pdrActive,
+  togglePdr,
+  startNodeId,
+  onSelectStart,
+  pdrPath,
+  wifiAnchor,
+  wifiStatus,
+  onMockAnchor,
+  wifiConfidence,
+  testMode,
+  pdrConfidence,
+  onRecenter,
+}) => {
   const pending = items.filter((i) => i.status === 'pending');
   const done = items.filter((i) => i.status === 'done');
   const matched = pending
@@ -913,123 +1050,182 @@ const NavigationSection: React.FC<{
           <Badge label={`${customNodes.length} Gänge`} tone="muted" />
         </View>
       </View>
-
-      <View style={styles.progressBar}>
-        <View style={[styles.progressFill, { width: `${Math.min(100, Math.round(progress * 100))}%` }]} />
-      </View>
-      <Text style={styles.metaMuted}>
-        Fortschritt: {Math.min(100, Math.round(progress * 100))}% (abhängig von abgehakten Artikeln)
-      </Text>
-
-      <View style={styles.glassCard}>
-        <Text style={styles.sectionTitle}>Floorplan anpassen</Text>
-        <Text style={styles.metaMuted}>Füge Gänge hinzu und platziere sie im Raster.</Text>
-        <View style={styles.quickChipRow}>
-          {quickSections.map((qs) => (
-            <Pressable
-              key={qs.section}
-              style={styles.quickChip}
-              onPress={() => {
-                const slot = findFreeSlot();
-                addNode(qs.label, qs.section, slot.row, slot.col);
-              }}
-            >
-              <Text style={styles.quickChipText}>{qs.label}</Text>
+      <View style={styles.pdrCard}>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Text style={styles.sectionTitle}>Sensor-Tracking</Text>
+          <Pressable style={[styles.primaryButton, { paddingVertical: 8 }]} onPress={togglePdr}>
+            <Text style={styles.primaryButtonText}>{pdrActive ? 'Stop' : 'Start'}</Text>
+          </Pressable>
+        </View>
+        <View style={styles.pdrRow}>
+          <Badge label={`Steps ${pdrState.steps}`} tone="accent" />
+          <Badge label={`Heading ${pdrState.heading.toFixed(0)}°`} />
+          <Badge label={`Floor ~${pdrState.floor}`} />
+          <Badge label={pdrState.status === 'tracking' ? 'Live' : pdrState.status === 'denied' ? 'Denied' : 'Idle'} tone={pdrState.status === 'tracking' ? 'success' : 'muted'} />
+          <Badge label={`Pfad ${pdrPath.length}`} />
+          <Badge label={`Wi-Fi ${wifiStatus}${wifiAnchor ? ` • ${wifiAnchor.label}` : ''}`} />
+          <Badge label={`Conf ${Math.round(wifiConfidence * 100)}%`} />
+          <Badge label={`PDR ${pdrConfidence}`} />
+        </View>
+        <View style={styles.pdrRow}>
+          {wifiAnchorsConfig.map((anchor) => (
+            <Pressable key={anchor.bssid} style={styles.ghostButton} onPress={() => onMockAnchor(anchor)}>
+              <Ionicons name="wifi" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>{anchor.label}</Text>
             </Pressable>
           ))}
-        </View>
-        <View style={styles.floorForm}>
-          <TextInput
-            style={[styles.searchInput, styles.floorInput]}
-            placeholder="Label (z.B. Milch)"
-            value={form.label}
-            onChangeText={(v) => setForm({ label: v })}
-          />
-          <TextInput
-            style={[styles.searchInput, styles.floorInput]}
-            placeholder="Section ID (z.B. dairy)"
-            value={form.section}
-            onChangeText={(v) => setForm({ section: v })}
-          />
-          <View style={[styles.row, { gap: 8 }]}>
-            <TextInput
-              style={[styles.searchInput, styles.floorInputSmall]}
-              placeholder="Row (0-5)"
-              keyboardType="numeric"
-              value={form.row}
-              onChangeText={(v) => setForm({ row: v })}
-            />
-            <TextInput
-              style={[styles.searchInput, styles.floorInputSmall]}
-              placeholder="Col (0-5)"
-              keyboardType="numeric"
-              value={form.col}
-              onChangeText={(v) => setForm({ col: v })}
-            />
-          </View>
-          <View style={[styles.row, { gap: 8, marginTop: 6 }]}>
-            <Pressable
-              style={styles.primaryButton}
-              onPress={() => {
-                const r = Math.max(0, Math.min(5, Number(form.row) || 0));
-                const c = Math.max(0, Math.min(5, Number(form.col) || 0));
-                addNode(form.label || 'Gang', form.section || 'custom', r, c);
-              }}
-            >
-              <Ionicons name="add" size={18} color={colors.text} />
-              <Text style={styles.primaryButtonText}>Gang hinzufügen</Text>
-            </Pressable>
-            <Pressable style={styles.ghostButton} onPress={clearNodes}>
-              <Ionicons name="trash-outline" size={18} color={colors.muted} />
-              <Text style={styles.metaText}>Zurücksetzen</Text>
-            </Pressable>
-          </View>
+          <Pressable
+            style={styles.ghostButton}
+            onPress={onRecenter}
+          >
+            <Ionicons name="refresh" size={16} color={colors.accent} />
+            <Text style={styles.metaText}>Recenter</Text>
+          </Pressable>
         </View>
       </View>
 
-      <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={optimiseRoute}>
-        <Ionicons name="navigate" size={18} color={colors.text} />
-        <Text style={styles.primaryButtonText}>Route optimieren</Text>
-      </Pressable>
+      {!testMode && (
+        <>
+          <View style={styles.progressBar}>
+            <View style={[styles.progressFill, { width: `${Math.min(100, Math.round(progress * 100))}%` }]} />
+          </View>
+          <Text style={styles.metaMuted}>
+            Fortschritt: {Math.min(100, Math.round(progress * 100))}% (abhängig von abgehakten Artikeln)
+          </Text>
+        </>
+      )}
 
-      <FloorplanCanvas nodes={[...baseFloorNodes, ...customNodes]} routeOrder={routeOrder} visited={visited} />
-
-      <View style={styles.routeSteps}>
-        {orderedSections.map((section, idx) => {
-          const sectionItems = matched.filter((m) => m.section.id === section.id).map((m) => m.item.name);
-          return (
-            <View key={section.id} style={styles.routeStep}>
-              <View style={styles.routeStepCircle}>
-                <Text style={styles.routeStepText}>{idx + 1}</Text>
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.sectionTitle}>{section.label}</Text>
-                <Text style={styles.metaMuted}>{sectionItems.join(', ')}</Text>
-              </View>
-              <Badge label={`Gang ${section.aisle}`} tone="accent" />
+      {!testMode && (
+        <View style={styles.glassCard}>
+          <Text style={styles.sectionTitle}>Floorplan anpassen</Text>
+          <Text style={styles.metaMuted}>Füge Gänge hinzu und platziere sie im Raster.</Text>
+          <View style={styles.quickChipRow}>
+            {quickSections.map((qs) => (
+              <Pressable
+                key={qs.section}
+                style={styles.quickChip}
+                onPress={() => {
+                  const slot = findFreeSlot();
+                  addNode(qs.label, qs.section, slot.row, slot.col);
+                }}
+              >
+                <Text style={styles.quickChipText}>{qs.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+          <View style={styles.floorForm}>
+            <TextInput
+              style={[styles.searchInput, styles.floorInput]}
+              placeholder="Label (z.B. Milch)"
+              value={form.label}
+              onChangeText={(v) => setForm({ label: v })}
+            />
+            <TextInput
+              style={[styles.searchInput, styles.floorInput]}
+              placeholder="Section ID (z.B. dairy)"
+              value={form.section}
+              onChangeText={(v) => setForm({ section: v })}
+            />
+            <View style={[styles.row, { gap: 8 }]}>
+              <TextInput
+                style={[styles.searchInput, styles.floorInputSmall]}
+                placeholder="Row (0-5)"
+                keyboardType="numeric"
+                value={form.row}
+                onChangeText={(v) => setForm({ row: v })}
+              />
+              <TextInput
+                style={[styles.searchInput, styles.floorInputSmall]}
+                placeholder="Col (0-5)"
+                keyboardType="numeric"
+                value={form.col}
+                onChangeText={(v) => setForm({ col: v })}
+              />
             </View>
-          );
-        })}
+            <View style={[styles.row, { gap: 8, marginTop: 6 }]}>
+              <Pressable
+                style={styles.primaryButton}
+                onPress={() => {
+                  const r = Math.max(0, Math.min(5, Number(form.row) || 0));
+                  const c = Math.max(0, Math.min(5, Number(form.col) || 0));
+                  addNode(form.label || 'Gang', form.section || 'custom', r, c);
+                }}
+              >
+                <Ionicons name="add" size={18} color={colors.text} />
+                <Text style={styles.primaryButtonText}>Gang hinzufügen</Text>
+              </Pressable>
+              <Pressable style={styles.ghostButton} onPress={clearNodes}>
+                <Ionicons name="trash-outline" size={18} color={colors.muted} />
+                <Text style={styles.metaText}>Zurücksetzen</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {!testMode && (
+        <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={optimiseRoute}>
+          <Ionicons name="navigate" size={18} color={colors.text} />
+          <Text style={styles.primaryButtonText}>Route optimieren</Text>
+        </Pressable>
+      )}
+
+      <View style={styles.mapLegend}>
+        <Text style={styles.metaMuted}>Tippe auf einen Punkt, um den Start zu setzen.</Text>
+        <Badge label={`Start: ${startNodeId}`} />
+        {wifiAnchor ? <Badge label={`Anchor: ${wifiAnchor.label}`} tone="accent" /> : null}
       </View>
 
-      <View style={styles.navCtaRow}>
-        <View>
-          <Text style={styles.sectionTitle}>Zeit sparen im Markt</Text>
-          <Text style={styles.metaMuted}>Aisle-Hints sind Free. Turn-by-Turn im Pro/Familienplan.</Text>
+      <FloorplanCanvas
+        nodes={[...baseFloorNodes, ...customNodes]}
+        routeOrder={routeOrder}
+        visited={visited}
+        startId={startNodeId}
+        onSelectNode={(node) => onSelectStart(node.id)}
+        path={pdrPath}
+        current={pdrPath[pdrPath.length - 1]}
+      />
+
+      {!testMode && (
+        <View style={styles.routeSteps}>
+          {orderedSections.map((section, idx) => {
+            const sectionItems = matched.filter((m) => m.section.id === section.id).map((m) => m.item.name);
+            return (
+              <View key={section.id} style={styles.routeStep}>
+                <View style={styles.routeStepCircle}>
+                  <Text style={styles.routeStepText}>{idx + 1}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.sectionTitle}>{section.label}</Text>
+                  <Text style={styles.metaMuted}>{sectionItems.join(', ')}</Text>
+                </View>
+                <Badge label={`Gang ${section.aisle}`} tone="accent" />
+              </View>
+            );
+          })}
         </View>
-        <Pressable style={styles.primaryButton}>
-          <Ionicons name="navigate" size={18} color="#fff" />
-          <Text style={styles.primaryButtonText}>Route starten</Text>
-        </Pressable>
-      </View>
+      )}
+
+      {!testMode && (
+        <View style={styles.navCtaRow}>
+          <View>
+            <Text style={styles.sectionTitle}>Zeit sparen im Markt</Text>
+            <Text style={styles.metaMuted}>Aisle-Hints sind Free. Turn-by-Turn im Pro/Familienplan.</Text>
+          </View>
+          <Pressable style={styles.primaryButton}>
+            <Ionicons name="navigate" size={18} color="#fff" />
+            <Text style={styles.primaryButtonText}>Route starten</Text>
+          </Pressable>
+        </View>
+      )}
     </Section>
   );
 };
 
-const PlansSection: React.FC<{ activeTier: TierId; setActiveTier: (id: TierId) => void }> = ({
-  activeTier,
-  setActiveTier,
-}) => (
+const PlansSection: React.FC<{
+  activeTier: TierId;
+  setActiveTier: (id: TierId) => void;
+}> = ({ activeTier, setActiveTier }) => (
   <Section title="Upsell & Wochenplanung" subtitle="Freemium mit klaren Stufen und Add-on für AI.">
     <View style={styles.tierGrid}>
       <TierCard id="free" active={activeTier === 'free'} onSelect={() => setActiveTier('free')} />
@@ -1044,15 +1240,15 @@ const PlansSection: React.FC<{ activeTier: TierId; setActiveTier: (id: TierId) =
         <Text style={styles.metaText}>Cremiges Gemüse-Curry</Text>
       </View>
       <View style={styles.planRow}>
-        <Badge label="Di" tone="accent" />
-        <Text style={styles.metaText}>Protein Bowl</Text>
-      </View>
-      <View style={styles.planRow}>
-        <Badge label="Mi" tone="accent" />
-        <Text style={styles.metaText}>Pasta Verde</Text>
-      </View>
+      <Badge label="Di" tone="accent" />
+      <Text style={styles.metaText}>Protein Bowl</Text>
     </View>
-  </Section>
+    <View style={styles.planRow}>
+      <Badge label="Mi" tone="accent" />
+      <Text style={styles.metaText}>Pasta Verde</Text>
+    </View>
+  </View>
+</Section>
 );
 
 const TabBar: React.FC<{ activeTab: TabId; onChange: (id: TabId) => void }> = ({ activeTab, onChange }) => (
@@ -1100,6 +1296,36 @@ export default function App() {
   const [sortMode, setSortMode] = useState<SortMode>('category');
   const [recent, setRecent] = useState<string[]>(['Milch', 'Brot', 'Eier']);
   const [activity, setActivity] = useState<string[]>(['Willkommen in deiner Liste.']);
+  const [pdrActive, setPdrActive] = useState(false);
+  const [pdrState, setPdrState] = useState<PdrState>({ steps: 0, heading: 0, floor: 0, pressure: 0, status: 'idle' });
+  const pdrBaseline = React.useRef<number | null>(null);
+  const [startNodeId, setStartNodeId] = useState<string>('entry');
+  const [pdrPath, setPdrPath] = useState<PdrPoint[]>([]);
+  const headingRef = React.useRef(0);
+  const magHeadingRef = React.useRef(0);
+  const lastStepsRef = React.useRef(0);
+  const gyroHeadingRef = React.useRef(0);
+  const lastGyroTs = React.useRef<number | null>(null);
+  const [pdrConfidence, setPdrConfidence] = useState<'good' | 'ok' | 'low'>('ok');
+  const accelBaseline = React.useRef(0);
+  const accelPeak = React.useRef(0);
+  const lastStepTime = React.useRef<number>(0);
+  const stepLengthRef = React.useRef(0.6);
+  const getStartCoord = React.useCallback((): PdrPoint => {
+    const all = [...baseFloorNodes, ...customNodes];
+    const node = all.find((n) => n.id === startNodeId) || all[0];
+    return { x: (node?.col ?? 0) + 0.5, y: (node?.row ?? 0) + 0.5 };
+  }, [startNodeId, customNodes]);
+  const [wifiAnchor, setWifiAnchor] = useState<WifiAnchor | null>(null);
+  const [wifiStatus, setWifiStatus] = useState<'mock' | 'live' | 'off'>('mock');
+  const [wifiConfidence, setWifiConfidence] = useState(0.7);
+  const recenterPdr = React.useCallback(() => {
+    const all = [...baseFloorNodes, ...customNodes];
+    const node = all.find((n) => n.id === startNodeId) || all[0];
+    setPdrPath([{ x: (node?.col ?? 0) + 0.5, y: (node?.row ?? 0) + 0.5 }]);
+    setPdrState((s) => ({ ...s, steps: 0 }));
+    lastStepsRef.current = 0;
+  }, [customNodes, startNodeId]);
 
   const pickRecipeFromPrompt = (prompt: string) => {
     const words = prompt
@@ -1217,7 +1443,8 @@ export default function App() {
 
     // simple sort: row then col for deterministic "fastest" placeholder
     const sorted = nodeOrder.sort((a, b) => a.row - b.row || a.col - b.col).map((n) => n.id);
-    setRouteOrder(['entry', ...sorted, 'exit']);
+    const start = nodeOrder.find((n) => n.id === startNodeId) || baseFloorNodes.find((n) => n.id === startNodeId) || baseFloorNodes[0];
+    setRouteOrder([start?.id || 'entry', ...sorted.filter((id) => id !== (start?.id || 'entry')), 'exit']);
   };
 
   const removeItem = (id: string) => {
@@ -1265,6 +1492,136 @@ export default function App() {
   );
 
   const offlineCopy = { title: t.offlineTitle, message: t.offlineMessage };
+
+  React.useEffect(() => {
+    let gyroSub: any;
+    let magSub: any;
+    let baroSub: any;
+    let accelSub: any;
+    const start = async () => {
+      if (!pdrActive) return;
+      setPdrState((s) => ({ ...s, status: 'tracking', steps: 0 }));
+      lastStepsRef.current = 0;
+      setPdrPath([getStartCoord()]);
+      headingRef.current = 0;
+      gyroHeadingRef.current = 0;
+      magHeadingRef.current = 0;
+      lastGyroTs.current = null;
+
+      // Magnetometer: heavily smoothed, only used as a slow corrector
+      magSub = Magnetometer.addListener(({ x, y }) => {
+        const angle = Math.atan2(y, x) * (180 / Math.PI);
+        const heading = wrapHeading(angle);
+        const diff = headingDiff(heading, magHeadingRef.current);
+        const factor = Math.abs(diff) < 30 ? 0.12 : 0.04;
+        magHeadingRef.current = wrapHeading(magHeadingRef.current + diff * factor);
+      });
+      Magnetometer.setUpdateInterval(200);
+
+      // Heading: gyro integration + complementary blend with mag
+      gyroSub = Gyroscope.addListener(({ z, timestamp }) => {
+        const ts = timestamp || Date.now();
+        if (lastGyroTs.current) {
+          const dt = (ts - lastGyroTs.current) / 1000;
+          gyroHeadingRef.current = wrapHeading(gyroHeadingRef.current + (z || 0) * (180 / Math.PI) * dt);
+        }
+        lastGyroTs.current = ts;
+        const fused = wrapHeading(gyroHeadingRef.current * 0.96 + magHeadingRef.current * 0.04);
+        const delta = headingDiff(fused, headingRef.current);
+        const limited = Math.max(-5, Math.min(5, delta));
+        headingRef.current = wrapHeading(headingRef.current + limited);
+        setPdrState((s) => ({ ...s, heading: headingRef.current }));
+      });
+      Gyroscope.setUpdateInterval(100);
+
+      accelSub = Accelerometer.addListener(({ x, y, z, timestamp }) => {
+        const ts = timestamp || Date.now();
+        const mag = Math.sqrt((x || 0) ** 2 + (y || 0) ** 2 + (z || 0) ** 2);
+        if (!accelBaseline.current) accelBaseline.current = mag;
+        accelBaseline.current = accelBaseline.current * 0.95 + mag * 0.05; // slow drift
+        const diff = Math.abs(mag - accelBaseline.current);
+        accelPeak.current = Math.max(accelPeak.current * 0.9, diff);
+        const threshold = Math.max(0.12, accelBaseline.current * 0.015);
+        const now = ts;
+        const minInterval = 250; // ms
+        if (diff > threshold && now - lastStepTime.current > minInterval) {
+          lastStepTime.current = now;
+          const stepLen = Math.max(0.45, Math.min(1.0, 0.6 + diff * 0.05));
+          stepLengthRef.current = stepLen;
+          const hRad = (headingRef.current * Math.PI) / 180;
+          setPdrPath((prev) => {
+            const coords: PdrPoint[] = [...prev];
+            const current = coords[coords.length - 1] || getStartCoord();
+            let x = current.x + Math.sin(hRad) * stepLen;
+            let y = current.y - Math.cos(hRad) * stepLen;
+            x = Math.max(0, Math.min(6, x));
+            y = Math.max(0, Math.min(6, y));
+            coords.push({ x, y });
+            return coords.slice(-200);
+          });
+          setPdrState((s) => ({ ...s, steps: s.steps + 1 }));
+        }
+        // confidence heuristic
+        const headingVar = Math.abs(headingDiff(gyroHeadingRef.current, headingRef.current));
+        const quality = headingVar < 10 && diff > threshold ? 'good' : headingVar < 25 ? 'ok' : 'low';
+        setPdrConfidence(quality as 'good' | 'ok' | 'low');
+      });
+      Accelerometer.setUpdateInterval(60);
+
+      baroSub = Barometer.addListener(({ pressure }) => {
+        if (pdrBaseline.current === null) {
+          pdrBaseline.current = pressure;
+        }
+        const delta = (pdrBaseline.current ?? pressure) - pressure;
+        const approxMeters = delta * 8.3; // rough meters per hPa
+        const floor = Math.round(approxMeters / 3);
+        setPdrState((s) => ({ ...s, pressure, floor }));
+      });
+    };
+
+    const stop = () => {
+      gyroSub?.remove?.();
+      magSub?.remove?.();
+      baroSub?.remove?.();
+      accelSub?.remove?.();
+    };
+
+    start();
+    return () => stop();
+  }, [pdrActive]);
+
+  React.useEffect(() => {
+    if (!pdrActive) {
+      pdrBaseline.current = null;
+      setPdrState((s) => ({ ...s, status: 'idle' }));
+      lastStepsRef.current = 0;
+    }
+  }, [pdrActive]);
+
+  React.useEffect(() => {
+    setPdrPath([getStartCoord()]);
+  }, [getStartCoord]);
+
+  React.useEffect(() => {
+    if (!pdrActive || !wifiAnchor) return;
+    const anchorCoord: PdrPoint = { x: wifiAnchor.col + 0.5, y: wifiAnchor.row + 0.5 };
+    const conf = wifiConfidence || wifiAnchor.confidence || 0.7;
+    setPdrPath((prev) => {
+      const current = prev[prev.length - 1] || anchorCoord;
+      const dist = Math.hypot(current.x - anchorCoord.x, current.y - anchorCoord.y);
+      if (dist > 3 && conf < 0.6) return prev; // low confidence, ignore far anchor
+      if (dist > 3) {
+        // hard reset if far
+        return [anchorCoord];
+      }
+      const blend = Math.min(1, conf * 0.7);
+      const blended = {
+        x: current.x * (1 - blend) + anchorCoord.x * blend,
+        y: current.y * (1 - blend) + anchorCoord.y * blend,
+      };
+      return [...prev, blended].slice(-50);
+    });
+  }, [wifiAnchor, pdrActive]);
 
   if (!fontsLoaded) {
     return (
@@ -1375,14 +1732,51 @@ export default function App() {
               visited={customNodes.filter((n) => n.sectionId && items.some((i) => i.status === 'done' && storeSections.find((s) => s.id === n.sectionId && s.items.some((nm) => nm.toLowerCase() === i.name.toLowerCase())))).map((n) => n.id)}
               form={floorForm}
               setForm={(f) => setFloorForm((prev) => ({ ...prev, ...f }))}
+              pdrState={pdrState}
+              pdrActive={pdrActive}
+              togglePdr={() => setPdrActive((v) => !v)}
+              startNodeId={startNodeId}
+              onSelectStart={(id) => {
+                setStartNodeId(id);
+                const exists = [...baseFloorNodes, ...customNodes].some((n) => n.id === id);
+                if (exists) {
+                  setRouteOrder((prev) => [id, ...prev.filter((p) => p !== id && p !== 'entry'), 'exit']);
+                }
+                const all = [...baseFloorNodes, ...customNodes];
+                const node = all.find((n) => n.id === id);
+                if (node) {
+                  setPdrPath([{ x: node.col + 0.5, y: node.row + 0.5 }]);
+                  lastStepsRef.current = 0;
+                }
+              }}
+              pdrPath={pdrPath}
+              wifiAnchor={wifiAnchor}
+              wifiStatus={wifiStatus}
+              wifiConfidence={wifiConfidence}
+              onMockAnchor={(anchor) => {
+                setWifiAnchor(anchor);
+                setWifiStatus('mock');
+                setWifiConfidence(anchor.confidence ?? 0.7);
+              }}
+              pdrConfidence={pdrConfidence}
+              onRecenter={recenterPdr}
+              testMode
             />
           ) : null}
 
-            {activeTab === 'plans' ? <PlansSection activeTier={activeTier} setActiveTier={setActiveTier} /> : null}
+            {activeTab === 'plans' ? (
+              <PlansSection
+                activeTier={activeTier}
+                setActiveTier={setActiveTier}
+              />
+            ) : null}
           </ScrollView>
           </LinearGradient>
 
-          <Pressable style={styles.fab} onPress={() => setAiOpen((v) => !v)}>
+          <Pressable
+            style={styles.fab}
+            onPress={() => setAiOpen((v) => !v)}
+          >
             <Ionicons name="sparkles" size={22} color="#0D1528" />
             <Text style={styles.fabText}>AI</Text>
             <View style={styles.fabBadge}>
@@ -1726,7 +2120,7 @@ const styles = StyleSheet.create({
   selectedRecipe: { marginTop: 12, padding: 12, borderRadius: 12, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.accentSoft },
   gatedText: { color: colors.warning, marginTop: 6 },
   map: { borderWidth: 1, borderColor: colors.border, borderRadius: 16, padding: 12, backgroundColor: '#FFF4EA' },
-  mapLegend: { marginBottom: 10 },
+  mapLegend: { marginBottom: 10, flexDirection: 'row', gap: 8, alignItems: 'center' },
   mapRows: { gap: 12 },
   aisle: { backgroundColor: colors.card, padding: 8, borderRadius: 12, borderWidth: 1, borderColor: colors.border },
   aisleLabel: { fontWeight: '700', color: colors.text, fontFamily: 'Manrope_700Bold' },
@@ -1791,6 +2185,22 @@ const styles = StyleSheet.create({
     shadowColor: colors.shadow,
     shadowOpacity: 0.16,
     shadowRadius: 10,
+    position: 'relative',
+  },
+  floorOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  floorPathLine: { position: 'absolute', height: 3, backgroundColor: colors.accent, borderRadius: 2, opacity: 0.7 },
+  floorPathDot: { position: 'absolute', width: 8, height: 8, borderRadius: 4, backgroundColor: colors.accent },
+  floorCurrentDot: {
+    position: 'absolute',
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: colors.success,
+    borderWidth: 2,
+    borderColor: '#fff',
+    shadowColor: colors.success,
+    shadowOpacity: 0.6,
+    shadowRadius: 6,
   },
   floorRow: { flexDirection: 'row' },
   floorCell: {
@@ -1857,6 +2267,16 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
   },
   navPills: { flexDirection: 'row', gap: 6 },
+  pdrCard: {
+    marginTop: 8,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: '#FFF4EA',
+    gap: 8,
+  },
+  pdrRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   glassCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 14,

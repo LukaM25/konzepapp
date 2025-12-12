@@ -13,7 +13,12 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMotionUsageDescription": "Wir nutzen Bewegungssensoren, um indoor Navigation und Schrittzählung zu ermöglichen.",
+        "NSLocationWhenInUseUsageDescription": "Optional für genauere Indoor-Position und Navigationsanker.",
+        
+      }
     },
     "android": {
       "adaptiveIcon": {
