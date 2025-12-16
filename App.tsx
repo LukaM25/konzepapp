@@ -16,7 +16,7 @@ import {
 import { Barometer, DeviceMotion, Magnetometer, Pedometer } from 'expo-sensors';
 import { pilotStoreMap, type StoreMap, type StoreMapAnchor, type StoreMapNode } from './navigation/storeMap';
 import { computePolylineForOrder, computeRouteOrder } from './navigation/routing';
-import { scanWifiReadings } from './navigation/wifi';
+import { scanWifi, type WifiReading } from './navigation/wifi';
 import { planConfigs, type PlanId } from './navigation/houseFloorplan';
 
 type HouseholdRole = 'owner' | 'editor' | 'viewer';
@@ -99,6 +99,12 @@ type SensorHealth = {
 };
 
 type PlanTool = 'start' | 'measure' | 'anchor';
+type WifiFix = {
+  x: number;
+  y: number;
+  matched: number;
+  best?: WifiReading;
+};
 
 const FloorplanImageCanvas: React.FC<{
   source: any;
@@ -185,6 +191,8 @@ const headingDiff = (a: number, b: number) => {
   const d = ((a - b + 540) % 360) - 180;
   return d;
 };
+const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+const normalizeBssid = (bssid: string) => bssid.trim().toLowerCase();
 
 const tabs: { id: TabId; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
   { id: 'home', label: 'Home', icon: 'home-outline' },
@@ -1051,9 +1059,17 @@ const NavigationSection: React.FC<{
   sensorHealth: SensorHealth;
   wifiAnchor: StoreMapAnchor | null;
   wifiStatus: 'mock' | 'live' | 'off';
+  wifiNote?: string | null;
+  wifiLastScanAt?: number | null;
+  wifiLastCount?: number;
+  wifiFix?: WifiFix | null;
   onMockAnchor: (anchor: StoreMapAnchor) => void;
   onScanWifi?: () => void;
+  onUseBestWifiAsAnchor?: () => void;
   wifiConfidence: number;
+  strideScale?: number;
+  onAdjustStrideScale?: (delta: number) => void;
+  onResetHeading?: () => void;
   testMode?: boolean;
   pdrConfidence: 'good' | 'ok' | 'low';
   onRecenter: () => void;
@@ -1100,9 +1116,17 @@ const NavigationSection: React.FC<{
   sensorHealth,
   wifiAnchor,
   wifiStatus,
+  wifiNote,
+  wifiLastScanAt,
+  wifiLastCount,
+  wifiFix,
   onMockAnchor,
   onScanWifi,
+  onUseBestWifiAsAnchor,
   wifiConfidence,
+  strideScale,
+  onAdjustStrideScale,
+  onResetHeading,
   testMode = false,
   pdrConfidence,
   onRecenter,
@@ -1171,6 +1195,7 @@ const NavigationSection: React.FC<{
   const stepPulse = lastStepAgoSec !== null && lastStepAgoSec < 0.6;
   const sensorLabel = (ok: boolean | null) => (ok === null ? '?' : ok ? 'ok' : 'no');
   const ageSec = (t: number | null) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s` : '—');
+  const wifiAge = wifiLastScanAt ? `${((Date.now() - wifiLastScanAt) / 1000).toFixed(1)}s` : '—';
   const gridSize = storeMap.gridSize;
   const anchors: StoreMapAnchor[] = storeMap.anchors ?? [];
 
@@ -1244,6 +1269,12 @@ const NavigationSection: React.FC<{
           <Badge label={`OS ${Platform.OS}`} />
         </View>
         <View style={styles.pdrRow}>
+          <Badge label={`Wi‑Fi scan ${wifiAge}`} />
+          <Badge label={`APs ${wifiLastCount ?? 0}`} />
+          <Badge label={`match ${wifiFix?.matched ?? 0}`} />
+          {wifiFix?.best ? <Badge label={`best ${wifiFix.best.level}dBm`} tone="accent" /> : <Badge label="best —" />}
+        </View>
+        <View style={styles.pdrRow}>
           <Badge label={`DevMotion ${sensorLabel(sensorHealth.deviceMotion.available)} ${ageSec(sensorHealth.deviceMotion.lastAt)}`} />
           <Badge
             label={`Pedom ${sensorLabel(sensorHealth.pedometer.available)} ${ageSec(sensorHealth.pedometer.lastAt)}${
@@ -1290,6 +1321,7 @@ const NavigationSection: React.FC<{
               .join(' | ')}
           </Text>
         ) : null}
+        {wifiNote ? <Text style={styles.metaMuted}>Wi‑Fi: {wifiNote}</Text> : null}
         <Text style={styles.metaMuted}>Step wenn diff &gt; th und Δt &gt; 250ms.</Text>
         <View style={styles.pdrRow}>
           {anchors.map((anchor) => (
@@ -1302,6 +1334,36 @@ const NavigationSection: React.FC<{
             <Pressable key="wifi-auto" style={styles.ghostButton} onPress={onScanWifi}>
               <Ionicons name="wifi" size={16} color={colors.accent} />
               <Text style={styles.metaText}>Auto Wi-Fi</Text>
+            </Pressable>
+          ) : null}
+          {onUseBestWifiAsAnchor ? (
+            <Pressable
+              key="wifi-cal"
+              style={styles.ghostButton}
+              onPress={onUseBestWifiAsAnchor}
+              disabled={!wifiFix?.best}
+            >
+              <Ionicons name="pin" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>{wifiFix?.best ? 'Use best AP as anchor' : 'Scan first'}</Text>
+            </Pressable>
+          ) : null}
+          {onAdjustStrideScale ? (
+            <Pressable key="stride-minus" style={styles.ghostButton} onPress={() => onAdjustStrideScale(-0.05)}>
+              <Ionicons name="remove" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Stride</Text>
+            </Pressable>
+          ) : null}
+          {typeof strideScale === 'number' ? <Badge label={`x${strideScale.toFixed(2)}`} tone="accent" /> : null}
+          {onAdjustStrideScale ? (
+            <Pressable key="stride-plus" style={styles.ghostButton} onPress={() => onAdjustStrideScale(0.05)}>
+              <Ionicons name="add" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Stride</Text>
+            </Pressable>
+          ) : null}
+          {onResetHeading ? (
+            <Pressable key="heading-reset" style={styles.ghostButton} onPress={onResetHeading}>
+              <Ionicons name="compass" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Align heading</Text>
             </Pressable>
           ) : null}
           <Pressable
@@ -1719,9 +1781,16 @@ export default function App() {
   const headingRef = React.useRef(0);
   const magHeadingRef = React.useRef(0);
   const gyroHeadingRef = React.useRef(0);
+  const gyroIntegratedHeadingRef = React.useRef(0);
+  const lastMotionAtRef = React.useRef<number | null>(null);
+  const yawRateRef = React.useRef(0);
+  const magStrengthEmaRef = React.useRef<number | null>(null);
+  const magReliabilityRef = React.useRef(0.5);
   const [pdrConfidence, setPdrConfidence] = useState<'good' | 'ok' | 'low'>('ok');
   const lastStepTime = React.useRef<number>(0);
   const stepLengthRef = React.useRef(0.6);
+  const strideScaleRef = React.useRef(1);
+  const [strideScale, setStrideScale] = useState(1);
   const [motionDebug, setMotionDebug] = useState<MotionDebug>({
     accelMag: 0,
     accelBaseline: 0,
@@ -1763,37 +1832,176 @@ export default function App() {
   const [wifiAnchor, setWifiAnchor] = useState<StoreMapAnchor | null>(null);
   const [wifiStatus, setWifiStatus] = useState<'mock' | 'live' | 'off'>('mock');
   const [wifiConfidence, setWifiConfidence] = useState(0.7);
+  const [wifiNote, setWifiNote] = useState<string | null>(null);
+  const [wifiLastScanAt, setWifiLastScanAt] = useState<number | null>(null);
+  const [wifiLastCount, setWifiLastCount] = useState(0);
+  const [wifiFix, setWifiFix] = useState<WifiFix | null>(null);
+  const wifiScanInFlightRef = React.useRef(false);
+  const wifiRssiEmaRef = React.useRef<Record<string, number>>({});
+  const computeWifiFix = React.useCallback(
+    (readings: WifiReading[], anchors: StoreMapAnchor[]): WifiFix | null => {
+      const byBssid = new Map<string, StoreMapAnchor>();
+      anchors.forEach((a) => byBssid.set(normalizeBssid(a.bssid), a));
+
+      const matched = readings
+        .filter((r) => r?.bssid)
+        .map((r) => ({ ...r, bssid: normalizeBssid(r.bssid) }))
+        .filter((r) => byBssid.has(r.bssid));
+
+      if (!matched.length) return null;
+
+      const best = matched.reduce((acc, r) => (r.level > acc.level ? r : acc), matched[0]);
+
+      const smoothed: { bssid: string; level: number }[] = matched.map((r) => {
+        const prev = wifiRssiEmaRef.current[r.bssid];
+        const next = prev === undefined ? r.level : prev * 0.65 + r.level * 0.35;
+        wifiRssiEmaRef.current[r.bssid] = next;
+        return { bssid: r.bssid, level: next };
+      });
+
+      let sumW = 0;
+      let x = 0;
+      let y = 0;
+      for (const r of smoothed) {
+        const a = byBssid.get(r.bssid);
+        if (!a) continue;
+        const w = clamp(Math.exp((clamp(r.level, -95, -35) + 100) / 10), 1, 400);
+        sumW += w;
+        x += a.x * w;
+        y += a.y * w;
+      }
+      if (sumW <= 0) return null;
+      return { x: x / sumW, y: y / sumW, matched: matched.length, best };
+    },
+    [],
+  );
+
+  const applyWifiCorrection = React.useCallback(
+    (fix: PdrPoint, conf: number) => {
+      setPdrPath((prev) => {
+        const current = prev[prev.length - 1] || fix;
+        const dist = Math.hypot(current.x - fix.x, current.y - fix.y);
+        const moving = !motionDebugRef.current.isStationary;
+        const blend = clamp(conf * (moving ? 0.35 : 0.75), 0.08, 0.7);
+
+        // If we're extremely far away but Wi‑Fi is strong, hard reset (helps after drift).
+        if (dist > 10 && conf > 0.75) return [fix];
+
+        // If Wi‑Fi is weak and far, ignore to prevent snapping to wrong AP.
+        if (dist > 6 && conf < 0.45) return prev;
+
+        const blended = { x: current.x * (1 - blend) + fix.x * blend, y: current.y * (1 - blend) + fix.y * blend };
+        return [...prev, blended].slice(-200);
+      });
+    },
+    [],
+  );
+
   const scanWifiOnce = React.useCallback(async () => {
     if (Platform.OS === 'web') {
       setWifiStatus('off');
       setWifiAnchor(null);
       setWifiConfidence(0);
+      setWifiNote('Wi‑Fi scan not available on web.');
+      setWifiLastScanAt(Date.now());
+      setWifiLastCount(0);
+      setWifiFix(null);
       return;
     }
-    const readings = await scanWifiReadings();
-    const anchors = activeStoreMap.anchors ?? [];
-    if (!readings.length || anchors.length === 0) {
-      setWifiStatus('off');
-      setWifiAnchor(null);
-      setWifiConfidence(0);
-      return;
+    if (wifiScanInFlightRef.current) return;
+    wifiScanInFlightRef.current = true;
+
+    const now = Date.now();
+    try {
+      const res = await scanWifi();
+      setWifiLastScanAt(now);
+      setWifiLastCount(res.readings.length);
+      setWifiNote(res.status === 'ok' ? null : res.message ?? 'Wi‑Fi scan failed.');
+
+      const readings = res.readings.filter((r) => r?.bssid);
+      const anchors = activeStoreMap.anchors ?? [];
+      if (!readings.length || anchors.length === 0) {
+        setWifiStatus('off');
+        setWifiAnchor(null);
+        setWifiConfidence(0);
+        setWifiFix(null);
+        return;
+      }
+
+      const fix = computeWifiFix(readings, anchors);
+      if (!fix) {
+        setWifiStatus('off');
+        setWifiAnchor(null);
+        setWifiConfidence(0.15);
+        setWifiFix(null);
+        return;
+      }
+
+      const bestBssid = fix.best?.bssid ? normalizeBssid(fix.best.bssid) : '';
+      const bestAnchor = anchors.find((a) => normalizeBssid(a.bssid) === bestBssid) ?? null;
+
+      const bestLevel = fix.best?.level ?? -90;
+      const base = clamp((bestLevel + 100) / 55, 0.15, 0.95);
+      const multiBoost = clamp(0.08 * (fix.matched - 1), 0, 0.2);
+      const conf = clamp(base + multiBoost, 0.15, 0.98);
+
+      setWifiFix(fix);
+      setWifiAnchor(bestAnchor ?? { bssid: bestBssid, label: `Wi‑Fi (${fix.matched})`, x: fix.x, y: fix.y, floor: 0, source: 'live', confidence: conf });
+      setWifiStatus('live');
+      setWifiConfidence(conf);
+      if (pdrActive) applyWifiCorrection({ x: fix.x, y: fix.y }, conf);
+    } finally {
+      wifiScanInFlightRef.current = false;
     }
-    const sorted = [...readings].sort((a, b) => b.level - a.level);
-    const matchReading = sorted.find((r) =>
-      anchors.some((a) => a.bssid.toLowerCase() === r.bssid.toLowerCase()),
-    );
-    if (!matchReading) {
-      setWifiStatus('off');
-      setWifiAnchor(null);
-      setWifiConfidence(0.2);
-      return;
-    }
-    const anchor = anchors.find((a) => a.bssid.toLowerCase() === matchReading.bssid.toLowerCase()) ?? null;
-    const conf = Math.min(1, Math.max(0.2, (matchReading.level + 100) / 70));
-    setWifiAnchor(anchor);
-    setWifiStatus('live');
-    setWifiConfidence(conf);
-  }, [activeStoreMap]);
+  }, [activeStoreMap, applyWifiCorrection, computeWifiFix, pdrActive]);
+
+  const useBestWifiAsAnchor = React.useCallback(() => {
+    if (navMapMode !== 'house') return;
+    const best = wifiFix?.best;
+    if (!best?.bssid) return;
+    const current = pdrPath[pdrPath.length - 1] || getStartCoord();
+    setPlanAnchorsById((prev) => {
+      const existing = prev[planId] ?? [];
+      const base =
+        existing[0] ??
+        ({
+          bssid: best.bssid,
+          label: 'Wi‑Fi Anchor',
+          x: current.x,
+          y: current.y,
+          floor: 0,
+          source: 'live',
+          confidence: 0.9,
+        } as StoreMapAnchor);
+      const updated0: StoreMapAnchor = {
+        ...base,
+        bssid: best.bssid,
+        label: base.label?.startsWith('Wi‑Fi') ? base.label : `Wi‑Fi Anchor`,
+        x: current.x,
+        y: current.y,
+        floor: 0,
+        source: 'live',
+        confidence: clamp(base.confidence ?? 0.85, 0.5, 0.98),
+      };
+      return { ...prev, [planId]: [updated0, ...existing.slice(1)] };
+    });
+  }, [getStartCoord, navMapMode, pdrPath, planId, wifiFix?.best]);
+
+  const adjustStrideScale = React.useCallback((delta: number) => {
+    setStrideScale((prev) => {
+      const next = clamp(Math.round((prev + delta) * 100) / 100, 0.6, 1.5);
+      strideScaleRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const resetHeadingToMag = React.useCallback(() => {
+    const mag = magHeadingRef.current;
+    headingRef.current = mag;
+    gyroIntegratedHeadingRef.current = mag;
+    gyroHeadingRef.current = mag;
+    setPdrState((s) => ({ ...s, heading: mag, gyroHeading: mag, magHeading: magHeadingRef.current }));
+  }, []);
   const recenterPdr = React.useCallback(() => {
     const all = [...activeStoreMap.nodes, ...customNodes];
     const node = all.find((n) => n.id === startNodeId) || all[0];
@@ -1983,12 +2191,17 @@ export default function App() {
     let pedometerSub: any;
     const start = async () => {
       if (!pdrActive) return;
-      setPdrState((s) => ({ ...s, status: 'tracking', steps: 0, heading: 0, gyroHeading: 0, magHeading: 0 }));
-      setPdrPath([getStartCoord()]);
-      headingRef.current = 0;
-      gyroHeadingRef.current = 0;
-      magHeadingRef.current = 0;
-      lastStepTime.current = 0;
+	      setPdrState((s) => ({ ...s, status: 'tracking', steps: 0, heading: 0, gyroHeading: 0, magHeading: 0 }));
+	      setPdrPath([getStartCoord()]);
+	      headingRef.current = 0;
+	      gyroHeadingRef.current = 0;
+	      gyroIntegratedHeadingRef.current = 0;
+	      magHeadingRef.current = 0;
+	      lastMotionAtRef.current = null;
+	      yawRateRef.current = 0;
+	      magStrengthEmaRef.current = null;
+	      magReliabilityRef.current = 0.5;
+	      lastStepTime.current = 0;
       lastIntervalRef.current = 0;
       stationarySinceRef.current = null;
       lastDebugUpdateRef.current = 0;
@@ -2006,12 +2219,12 @@ export default function App() {
         pedometer: { available: null, lastAt: null },
       };
       setSensorHealth(sensorHealthRef.current);
-      const initialDebug: MotionDebug = {
+	      const initialDebug: MotionDebug = {
         accelMag: 0,
         accelBaseline: 0,
         accelDiff: 0,
-        stepThreshold: 0.12,
-        stepLength: 0.6,
+	        stepThreshold: 0.12,
+	        stepLength: 0.6 * strideScaleRef.current,
         lastStepAt: null,
         lastIntervalMs: 0,
         isStationary: true,
@@ -2043,25 +2256,36 @@ export default function App() {
         pedometer: { ...sensorHealthRef.current.pedometer, available: pedOk },
       });
 
-      // Magnetometer: heavily smoothed, only used as a slow corrector
-      if (magOk) {
-        try {
-          Magnetometer.setUpdateInterval(200);
-          magSub = Magnetometer.addListener(({ x, y }) => {
-            sensorHealthRef.current = {
-              ...sensorHealthRef.current,
-              mag: { ...sensorHealthRef.current.mag, lastAt: Date.now() },
-            };
-            const angle = Math.atan2(y, x) * (180 / Math.PI);
-            const heading = wrapHeading(angle);
-            const diff = headingDiff(heading, magHeadingRef.current);
-            const factor = Math.abs(diff) < 30 ? 0.12 : 0.04;
-            magHeadingRef.current = wrapHeading(magHeadingRef.current + diff * factor);
-          });
-        } catch (e: any) {
-          updateSensorHealth({
-            mag: {
-              ...sensorHealthRef.current.mag,
+	      // Magnetometer: heavily smoothed, only used as a slow corrector
+	      if (magOk) {
+	        try {
+	          Magnetometer.setUpdateInterval(200);
+	          magSub = Magnetometer.addListener(({ x, y, z }) => {
+	            sensorHealthRef.current = {
+	              ...sensorHealthRef.current,
+	              mag: { ...sensorHealthRef.current.mag, lastAt: Date.now() },
+	            };
+	            const strength = Math.hypot(x ?? 0, y ?? 0, z ?? 0);
+	            const emaPrev = magStrengthEmaRef.current ?? strength;
+	            const ema = emaPrev * 0.92 + strength * 0.08;
+	            magStrengthEmaRef.current = ema;
+
+	            const dev = Math.abs(strength - ema);
+	            const inRange = ema > 15 && ema < 80; // µT typical range
+	            const stable = dev < 10;
+	            const relInstant = clamp((inRange ? 1 : 0.25) * (stable ? 1 : 0.5) * (1 - clamp(dev / 25, 0, 1)), 0, 1);
+	            magReliabilityRef.current = clamp(magReliabilityRef.current * 0.85 + relInstant * 0.15, 0, 1);
+
+	            const angle = Math.atan2(y ?? 0, x ?? 0) * (180 / Math.PI);
+	            const heading = wrapHeading(angle);
+	            const diff = headingDiff(heading, magHeadingRef.current);
+	            const factor = 0.03 + 0.09 * magReliabilityRef.current;
+	            magHeadingRef.current = wrapHeading(magHeadingRef.current + diff * factor);
+	          });
+	        } catch (e: any) {
+	          updateSensorHealth({
+	            mag: {
+	              ...sensorHealthRef.current.mag,
               available: false,
               error: String(e?.message || e),
             },
@@ -2071,28 +2295,26 @@ export default function App() {
 
       const toDeg = (v: number) => (Math.abs(v) <= Math.PI * 2 + 0.5 ? (v * 180) / Math.PI : v);
 
-	      const applyStep = (source: MotionDebug['stepSource'], stepsDelta: number, now: number) => {
-	        if (stepsDelta <= 0) return;
-	        const stepLen = stepLengthRef.current;
-	        const hRad = (headingRef.current * Math.PI) / 180;
-	        const clampMax = activeStoreMap.gridSize;
-	        setPdrPath((prev) => {
-	          const coords: PdrPoint[] = [...prev];
-	          let cur = coords[coords.length - 1] || getStartCoord();
-	          for (let i = 0; i < Math.min(stepsDelta, 20); i += 1) {
-	            let nx = cur.x + Math.sin(hRad) * stepLen;
-	            let ny = cur.y - Math.cos(hRad) * stepLen;
-	            if (navMapMode === 'pilot') {
-	              nx = Math.max(0, Math.min(clampMax, nx));
-	              ny = Math.max(0, Math.min(clampMax, ny));
-	            }
-	            cur = { x: nx, y: ny };
-	            coords.push(cur);
-	          }
-	          return coords.slice(-200);
-	        });
-        setPdrState((s) => ({ ...s, steps: s.steps + stepsDelta }));
-        const nextDebug = { ...motionDebugRef.current, stepSource: source, lastStepAt: now };
+		      const applyStep = (source: MotionDebug['stepSource'], stepsDelta: number, now: number) => {
+		        if (stepsDelta <= 0) return;
+		        const stepLen = stepLengthRef.current * strideScaleRef.current;
+		        const hRad = (headingRef.current * Math.PI) / 180;
+		        const clampMax = activeStoreMap.gridSize;
+		        setPdrPath((prev) => {
+		          const coords: PdrPoint[] = [...prev];
+		          let cur = coords[coords.length - 1] || getStartCoord();
+		          for (let i = 0; i < Math.min(stepsDelta, 20); i += 1) {
+		            let nx = cur.x + Math.sin(hRad) * stepLen;
+		            let ny = cur.y - Math.cos(hRad) * stepLen;
+		            nx = Math.max(0, Math.min(clampMax, nx));
+		            ny = Math.max(0, Math.min(clampMax, ny));
+		            cur = { x: nx, y: ny };
+		            coords.push(cur);
+		          }
+		          return coords.slice(-200);
+		        });
+	        setPdrState((s) => ({ ...s, steps: s.steps + stepsDelta }));
+	        const nextDebug = { ...motionDebugRef.current, stepSource: source, lastStepAt: now };
         motionDebugRef.current = nextDebug;
         setMotionDebug(nextDebug);
       };
@@ -2106,17 +2328,44 @@ export default function App() {
             sensorHealthRef.current = {
               ...sensorHealthRef.current,
               deviceMotion: { ...sensorHealthRef.current.deviceMotion, lastAt: now },
-            };
+	            };
+	
+	            const prevTs = lastMotionAtRef.current ?? now;
+	            const dt = clamp((now - prevTs) / 1000, 0.001, 0.2);
+	            lastMotionAtRef.current = now;
 
-            const rot = m.rotation;
-            const alphaDeg = rot ? wrapHeading(toDeg(rot.alpha)) : headingRef.current;
-            gyroHeadingRef.current = alphaDeg;
-            // Fuse OS attitude yaw with magnetic heading (small correction)
-            const mag = magHeadingRef.current;
-            const fused = wrapHeading(alphaDeg * 0.97 + mag * 0.03);
-            const delta = headingDiff(fused, headingRef.current);
-            headingRef.current = wrapHeading(headingRef.current + Math.max(-8, Math.min(8, delta)));
-            setPdrState((s) => ({ ...s, heading: headingRef.current, gyroHeading: alphaDeg, magHeading: magHeadingRef.current }));
+	            const rot = m.rotation;
+	            const attitudeYaw =
+	              rot && typeof rot.alpha === 'number' ? wrapHeading(toDeg(rot.alpha)) : null;
+	            if (attitudeYaw !== null) {
+	              gyroHeadingRef.current = attitudeYaw;
+	              const d = headingDiff(attitudeYaw, gyroIntegratedHeadingRef.current);
+	              gyroIntegratedHeadingRef.current = wrapHeading(gyroIntegratedHeadingRef.current + clamp(d, -20, 20));
+	            }
+
+	            const rr = (m as any).rotationRate as { alpha?: number; beta?: number; gamma?: number } | undefined;
+	            if (rr && typeof rr.alpha === 'number') {
+	              const yawRate = clamp(toDeg(rr.alpha), -720, 720);
+	              yawRateRef.current = yawRate;
+	              gyroIntegratedHeadingRef.current = wrapHeading(gyroIntegratedHeadingRef.current + yawRate * dt);
+	            } else {
+	              yawRateRef.current = 0;
+	            }
+
+	            const mag = magHeadingRef.current;
+	            const magReliability = magReliabilityRef.current;
+	            const turningFast = Math.abs(yawRateRef.current) > 140;
+	            const gain = (0.008 + 0.05 * magReliability) * (turningFast ? 0.2 : 1);
+	            const err = headingDiff(mag, gyroIntegratedHeadingRef.current);
+	            gyroIntegratedHeadingRef.current = wrapHeading(gyroIntegratedHeadingRef.current + err * gain);
+	            headingRef.current = gyroIntegratedHeadingRef.current;
+
+	            setPdrState((s) => ({
+	              ...s,
+	              heading: headingRef.current,
+	              gyroHeading: gyroIntegratedHeadingRef.current,
+	              magHeading: magHeadingRef.current,
+	            }));
 
             // Prefer native linear acceleration, fallback to high-pass filter on accelIncludingGravity.
             const lin = m.acceleration;
@@ -2186,28 +2435,40 @@ export default function App() {
               }
             }
 
-            const nextDebug: MotionDebug = {
-              ...motionDebugRef.current,
-              accelMag: linMag,
-              accelBaseline: mean,
-              accelDiff: Math.max(0, linMag - mean),
-              stepThreshold: threshold,
-              stepLength: stepLengthRef.current,
-              lastIntervalMs: lastIntervalRef.current,
-              isStationary,
-              deviceMotionLinAccMag: linMag,
-              pedometerSteps: motionDebugRef.current.pedometerSteps,
-              deviceSteps: deviceStepsRef.current,
-            };
-            motionDebugRef.current = nextDebug;
-            if (now - lastDebugUpdateRef.current > 150) {
-              lastDebugUpdateRef.current = now;
-              setMotionDebug(nextDebug);
-              setSensorHealth(sensorHealthRef.current);
-            }
-          });
-        } catch (e: any) {
-          updateSensorHealth({
+	            const nextDebug: MotionDebug = {
+	              ...motionDebugRef.current,
+	              accelMag: linMag,
+	              accelBaseline: mean,
+	              accelDiff: Math.max(0, linMag - mean),
+	              stepThreshold: threshold,
+	              stepLength: stepLengthRef.current * strideScaleRef.current,
+	              lastIntervalMs: lastIntervalRef.current,
+	              isStationary,
+	              deviceMotionLinAccMag: linMag,
+	              pedometerSteps: motionDebugRef.current.pedometerSteps,
+	              deviceSteps: deviceStepsRef.current,
+	            };
+
+	            // Lightweight quality signal to surface in UI (Android magnetometers can be noisy indoors).
+	            const stepRecent = nextDebug.lastStepAt ? now - nextDebug.lastStepAt < 1800 : false;
+	            let pdrScore = 0.35;
+	            if (stepRecent) pdrScore += 0.25;
+	            if (!isStationary) pdrScore += 0.1;
+	            const magReliability2 = magReliabilityRef.current;
+	            pdrScore += (magReliability2 - 0.5) * 0.35;
+	            if (Math.abs(yawRateRef.current) > 280) pdrScore -= 0.08;
+	            const nextPdrConf: 'good' | 'ok' | 'low' = pdrScore > 0.72 ? 'good' : pdrScore > 0.45 ? 'ok' : 'low';
+
+	            motionDebugRef.current = nextDebug;
+	            if (now - lastDebugUpdateRef.current > 150) {
+	              lastDebugUpdateRef.current = now;
+	              setMotionDebug(nextDebug);
+	              setSensorHealth(sensorHealthRef.current);
+	              setPdrConfidence(nextPdrConf);
+	            }
+	          });
+	        } catch (e: any) {
+	          updateSensorHealth({
             deviceMotion: {
               ...sensorHealthRef.current.deviceMotion,
               available: false,
@@ -2232,18 +2493,24 @@ export default function App() {
               permission: perm2 ? String(perm2.status) : undefined,
             },
           });
-          pedometerSub = Pedometer.watchStepCount(({ steps }) => {
-            const now = Date.now();
+	          pedometerSub = Pedometer.watchStepCount(({ steps }) => {
+	            const now = Date.now();
             sensorHealthRef.current = {
               ...sensorHealthRef.current,
               pedometer: { ...sensorHealthRef.current.pedometer, lastAt: now },
             };
-            const prev = lastPedometerStepsRef.current;
-            lastPedometerStepsRef.current = steps;
-            const delta = prev === null ? 0 : steps - prev;
-            if (delta > 0) {
-              applyStep('pedometer', delta, now);
-            }
+	            const prev = lastPedometerStepsRef.current;
+	            lastPedometerStepsRef.current = steps;
+	            const delta = prev === null ? 0 : steps - prev;
+	            if (delta > 0) {
+	              // Avoid double-counting when our DeviceMotion detector is already producing steps.
+	              const recentlyDeviceMotion = lastStepTime.current > 0 && now - lastStepTime.current < 1800;
+	              if (!devOk || !recentlyDeviceMotion) {
+	                lastIntervalRef.current = lastStepTime.current ? now - lastStepTime.current : 0;
+	                lastStepTime.current = now;
+	                applyStep('pedometer', delta, now);
+	              }
+	            }
             const nextDebug = {
               ...motionDebugRef.current,
               pedometerSteps: steps,
@@ -2318,25 +2585,12 @@ export default function App() {
   }, [getStartCoord]);
 
   React.useEffect(() => {
-    if (!pdrActive || !wifiAnchor) return;
-    const anchorCoord: PdrPoint = { x: wifiAnchor.x, y: wifiAnchor.y };
-    const conf = wifiConfidence || wifiAnchor.confidence || 0.7;
-    setPdrPath((prev) => {
-      const current = prev[prev.length - 1] || anchorCoord;
-      const dist = Math.hypot(current.x - anchorCoord.x, current.y - anchorCoord.y);
-      if (dist > 3 && conf < 0.6) return prev; // low confidence, ignore far anchor
-      if (dist > 3) {
-        // hard reset if far
-        return [anchorCoord];
-      }
-      const blend = Math.min(1, conf * 0.7);
-      const blended = {
-        x: current.x * (1 - blend) + anchorCoord.x * blend,
-        y: current.y * (1 - blend) + anchorCoord.y * blend,
-      };
-      return [...prev, blended].slice(-50);
-    });
-  }, [wifiAnchor, pdrActive]);
+    if (!pdrActive) return;
+    const id = setInterval(() => {
+      scanWifiOnce().catch(() => {});
+    }, 2500);
+    return () => clearInterval(id);
+  }, [pdrActive, scanWifiOnce]);
 
   if (!fontsLoaded) {
     return (
@@ -2471,43 +2725,63 @@ export default function App() {
               wifiAnchor={wifiAnchor}
               wifiStatus={wifiStatus}
               wifiConfidence={wifiConfidence}
+              wifiNote={wifiNote}
+              wifiLastScanAt={wifiLastScanAt}
+              wifiLastCount={wifiLastCount}
+              wifiFix={wifiFix}
+              strideScale={strideScale}
+              onAdjustStrideScale={adjustStrideScale}
+              onResetHeading={resetHeadingToMag}
               onMockAnchor={(anchor) => {
                 setWifiAnchor(anchor);
                 setWifiStatus('mock');
-                setWifiConfidence(anchor.confidence ?? 0.7);
+                const conf = anchor.confidence ?? 0.7;
+                setWifiConfidence(conf);
+                setWifiFix({ x: anchor.x, y: anchor.y, matched: 1 });
+                if (pdrActive) {
+                  // manual anchor selection should immediately correct the position for testing
+                  setPdrPath([{ x: anchor.x, y: anchor.y }]);
+                }
               }}
               onScanWifi={scanWifiOnce}
+              onUseBestWifiAsAnchor={navMapMode === 'house' ? useBestWifiAsAnchor : undefined}
               pdrConfidence={pdrConfidence}
               onRecenter={recenterPdr}
               mapMode={navMapMode}
-              onChangeMapMode={(m) => {
-                setNavMapMode(m);
-                setStartOverride(null);
-                setPdrPath([getStartCoord()]);
-                setWifiAnchor(null);
-                setWifiStatus('off');
-                setWifiConfidence(0);
-                setPlanCalA(null);
-                setPlanCalB(null);
-                setPlanCalMeters('');
-                setPlanTool('start');
-                setPlanMeasureA(null);
-                setPlanMeasureB(null);
-              }}
+	              onChangeMapMode={(m) => {
+	                setNavMapMode(m);
+	                setStartOverride(null);
+	                setPdrPath([getStartCoord()]);
+	                setWifiAnchor(null);
+	                setWifiStatus('off');
+	                setWifiConfidence(0);
+	                setWifiFix(null);
+	                setWifiNote(null);
+	                setWifiLastScanAt(null);
+	                setWifiLastCount(0);
+	                setPlanCalA(null);
+	                setPlanCalB(null);
+	                setPlanCalMeters('');
+	                setPlanTool('start');
+	                setPlanMeasureA(null);
+	                setPlanMeasureB(null);
+	              }}
               planId={planId}
-              onChangePlanId={(id) => {
-                setPlanId(id);
-                setPlanCalA(null);
-                setPlanCalB(null);
-                setPlanCalMeters('');
-                setStartOverride(null);
-                setPdrPath([getStartCoord()]);
-                const preset = planConfigs[id].defaultImagePixelsPerMeter;
-                if (preset) setPlanImagePixelsPerMeter(preset);
-                setPlanTool('start');
-                setPlanMeasureA(null);
-                setPlanMeasureB(null);
-              }}
+	              onChangePlanId={(id) => {
+	                setPlanId(id);
+	                setPlanCalA(null);
+	                setPlanCalB(null);
+	                setPlanCalMeters('');
+	                setStartOverride(null);
+	                setPdrPath([getStartCoord()]);
+	                setWifiFix(null);
+	                setWifiNote(null);
+	                const preset = planConfigs[id].defaultImagePixelsPerMeter;
+	                if (preset) setPlanImagePixelsPerMeter(preset);
+	                setPlanTool('start');
+	                setPlanMeasureA(null);
+	                setPlanMeasureB(null);
+	              }}
               planImage={activePlan.image}
               planImagePixelsPerMeter={planImagePixelsPerMeter}
               setPlanImagePixelsPerMeter={(n) => setPlanImagePixelsPerMeter(Math.max(1, Math.min(600, n)))}
@@ -2518,16 +2792,37 @@ export default function App() {
               planMeasureB={planMeasureB}
               setPlanMeasureA={setPlanMeasureA}
               setPlanMeasureB={setPlanMeasureB}
-              onSetAnchorAt={(pMeters) => {
-                setPlanAnchorsById((prev) => {
-                  const existing = prev[planId] ?? [];
-                  const updated =
-                    existing.length > 0
-                      ? [{ ...existing[0], x: pMeters.x, y: pMeters.y, floor: 0 }, ...existing.slice(1)]
-                      : [{ bssid: '8c:19:b5:d8:b1:6d', label: 'Home Wi‑Fi', x: pMeters.x, y: pMeters.y, floor: 0, source: 'live', confidence: 0.9 }];
-                  return { ...prev, [planId]: updated };
-                });
-              }}
+	              onSetAnchorAt={(pMeters) => {
+	                setPlanAnchorsById((prev) => {
+	                  const existing = prev[planId] ?? [];
+	                  const best = wifiFix?.best?.bssid;
+	                  const updated =
+	                    existing.length > 0
+	                      ? [
+	                          {
+	                            ...existing[0],
+	                            bssid: best ?? existing[0].bssid,
+	                            x: pMeters.x,
+	                            y: pMeters.y,
+	                            floor: 0,
+	                            source: 'live',
+	                          },
+	                          ...existing.slice(1),
+	                        ]
+	                      : [
+	                          {
+	                            bssid: best ?? '8c:19:b5:d8:b1:6d',
+	                            label: 'Wi‑Fi Anchor',
+	                            x: pMeters.x,
+	                            y: pMeters.y,
+	                            floor: 0,
+	                            source: 'live',
+	                            confidence: 0.9,
+	                          },
+	                        ];
+	                  return { ...prev, [planId]: updated };
+	                });
+	              }}
               planCalA={planCalA}
               planCalB={planCalB}
               setPlanCalA={setPlanCalA}

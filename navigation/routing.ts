@@ -66,23 +66,32 @@ const reconstruct = (prev: Record<string, string | null>, startId: string, endId
   return path.reverse();
 };
 
-const pairDistance = (map: StoreMap, adj: Adj, aId: string, bId: string) => {
-  if ((map.edges ?? []).length === 0) {
-    const a = map.nodes.find((n) => n.id === aId);
-    const b = map.nodes.find((n) => n.id === bId);
+const buildDistanceFn = (map: StoreMap, adj: Adj) => {
+  const nodesById = new Map(map.nodes.map((n) => [n.id, n] as const));
+  const hasEdges = (map.edges ?? []).length > 0;
+  const distCache = new Map<string, Record<string, number>>();
+  return (aId: string, bId: string) => {
+    if (!hasEdges) {
+      const a = nodesById.get(aId);
+      const b = nodesById.get(bId);
+      if (!a || !b) return Number.POSITIVE_INFINITY;
+      return distEuclid(a, b);
+    }
+    let distRow = distCache.get(aId);
+    if (!distRow) {
+      distRow = dijkstra(adj, aId).dist;
+      distCache.set(aId, distRow);
+    }
+    const d = distRow[bId];
+    if (Number.isFinite(d)) return d!;
+    const a = nodesById.get(aId);
+    const b = nodesById.get(bId);
     if (!a || !b) return Number.POSITIVE_INFINITY;
     return distEuclid(a, b);
-  }
-  const { dist } = dijkstra(adj, aId);
-  const d = dist[bId];
-  if (Number.isFinite(d)) return d!;
-  const a = map.nodes.find((n) => n.id === aId);
-  const b = map.nodes.find((n) => n.id === bId);
-  if (!a || !b) return Number.POSITIVE_INFINITY;
-  return distEuclid(a, b);
+  };
 };
 
-const nearestNeighborOrder = (map: StoreMap, adj: Adj, startId: string, stops: string[]) => {
+const nearestNeighborOrder = (pairDistance: (aId: string, bId: string) => number, startId: string, stops: string[]) => {
   const remaining = new Set(stops);
   const order: string[] = [];
   let current = startId;
@@ -90,7 +99,7 @@ const nearestNeighborOrder = (map: StoreMap, adj: Adj, startId: string, stops: s
     let bestId: string | null = null;
     let bestDist = Number.POSITIVE_INFINITY;
     remaining.forEach((id) => {
-      const d = pairDistance(map, adj, current, id);
+      const d = pairDistance(current, id);
       if (d < bestDist) {
         bestDist = d;
         bestId = id;
@@ -104,10 +113,15 @@ const nearestNeighborOrder = (map: StoreMap, adj: Adj, startId: string, stops: s
   return order;
 };
 
-const twoOptImprove = (map: StoreMap, adj: Adj, startId: string, endId: string, route: string[]) => {
+const twoOptImprove = (
+  pairDistance: (aId: string, bId: string) => number,
+  startId: string,
+  endId: string,
+  route: string[],
+) => {
   const full = [startId, ...route, endId];
   const cost = (seq: string[]) =>
-    seq.reduce((acc, id, i) => (i === 0 ? 0 : acc + pairDistance(map, adj, seq[i - 1], id)), 0);
+    seq.reduce((acc, id, i) => (i === 0 ? 0 : acc + pairDistance(seq[i - 1], id)), 0);
   let best = full;
   let bestCost = cost(best);
   let improved = true;
@@ -140,19 +154,25 @@ export const computeRouteOrder = (
 ) => {
   const uniqueStops = Array.from(new Set(stopNodeIds.filter((s) => s && s !== startId && s !== endId)));
   const adj = buildAdjacency(map);
-  const baseOrder = nearestNeighborOrder(map, adj, startId, uniqueStops);
-  const improved = twoOptImprove(map, adj, startId, endId, baseOrder);
+  const pairDistance = buildDistanceFn(map, adj);
+  const baseOrder = nearestNeighborOrder(pairDistance, startId, uniqueStops);
+  const improved = twoOptImprove(pairDistance, startId, endId, baseOrder);
   return [startId, ...improved, endId];
 };
 
 export const computePolylineForOrder = (map: StoreMap, order: string[]) => {
   const adj = buildAdjacency(map);
   if ((map.edges ?? []).length === 0) return order;
+  const prevCache = new Map<string, Record<string, string | null>>();
   const segments: string[] = [];
   for (let i = 0; i < order.length - 1; i += 1) {
     const a = order[i];
     const b = order[i + 1];
-    const { prev } = dijkstra(adj, a);
+    let prev = prevCache.get(a);
+    if (!prev) {
+      prev = dijkstra(adj, a).prev;
+      prevCache.set(a, prev);
+    }
     const path = reconstruct(prev, a, b);
     path.forEach((id, idx) => {
       if (idx === 0 && segments.length) return;

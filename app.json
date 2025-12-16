@@ -6,7 +6,7 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -17,18 +17,35 @@
       "infoPlist": {
         "NSMotionUsageDescription": "Wir nutzen Bewegungssensoren, um indoor Navigation und Schrittzählung zu ermöglichen.",
         "NSLocationWhenInUseUsageDescription": "Optional für genauere Indoor-Position und Navigationsanker."
-      }
+      },
+      "bundleIdentifier": "com.lukamatanic.konzepapp"
     },
     "android": {
+      "permissions": [
+        "ACCESS_WIFI_STATE",
+        "CHANGE_WIFI_STATE",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "NEARBY_WIFI_DEVICES"
+      ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.lukamatanic.konzepapp"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "a49a9b11-54ef-42f6-bec2-f5fcf18152dd"
+      }
+    },
+    "plugins": [
+      "expo-font"
+    ]
   }
 }

@@ -2,6 +2,12 @@
   "cli": { "version": ">= 3.17.0" },
   "build": {
     "development": {
+      "cache": {
+        "disabled": true
+      },
+      "env": {
+        "NODE_ENV": "development"
+      },
       "developmentClient": true,
       "distribution": "internal"
     }
