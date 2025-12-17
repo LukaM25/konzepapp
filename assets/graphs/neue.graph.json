@@ -1,0 +1,39 @@
+{
+  "id": "neue-walkable-v1",
+  "label": "Neue Walkable Graph (v1)",
+  "gridSize": 18,
+  "nodes": [
+    { "id": "entry", "label": "Entrance", "x": 13.0, "y": 15.7, "floor": 0, "type": "entry" },
+    { "id": "w0", "label": "Corridor (S)", "x": 13.0, "y": 13.5, "floor": 0, "type": "walkway" },
+    { "id": "w1", "label": "Corridor (M)", "x": 13.0, "y": 10.0, "floor": 0, "type": "walkway" },
+    { "id": "w2", "label": "Corridor (N)", "x": 13.0, "y": 6.5, "floor": 0, "type": "walkway" },
+    { "id": "w3", "label": "Main Junction", "x": 9.2, "y": 6.5, "floor": 0, "type": "walkway" },
+    { "id": "w4", "label": "Main Center", "x": 7.2, "y": 9.0, "floor": 0, "type": "walkway" },
+    { "id": "w5", "label": "Left Corridor", "x": 3.2, "y": 6.5, "floor": 0, "type": "walkway" },
+    { "id": "w6", "label": "Left Top", "x": 3.2, "y": 2.5, "floor": 0, "type": "walkway" },
+
+    { "id": "poi-living", "label": "Living", "x": 7.8, "y": 10.2, "floor": 0, "type": "poi" },
+    { "id": "poi-kitchen", "label": "Kitchen", "x": 9.0, "y": 8.6, "floor": 0, "type": "poi" },
+    { "id": "poi-office", "label": "Office", "x": 2.4, "y": 3.6, "floor": 0, "type": "poi" },
+    { "id": "poi-shed", "label": "Shed", "x": 2.4, "y": 6.2, "floor": 0, "type": "poi" },
+    { "id": "exit", "label": "Exit", "x": 13.0, "y": 15.7, "floor": 0, "type": "exit" }
+  ],
+  "edges": [
+    { "from": "entry", "to": "w0" },
+    { "from": "w0", "to": "w1" },
+    { "from": "w1", "to": "w2" },
+    { "from": "w2", "to": "w3" },
+    { "from": "w3", "to": "w4" },
+    { "from": "w3", "to": "w5" },
+    { "from": "w5", "to": "w6" },
+
+    { "from": "w4", "to": "poi-living", "bidirectional": true },
+    { "from": "w4", "to": "poi-kitchen", "bidirectional": true },
+    { "from": "w6", "to": "poi-office", "bidirectional": true },
+    { "from": "w5", "to": "poi-shed", "bidirectional": true },
+
+    { "from": "entry", "to": "exit", "distance": 0, "bidirectional": true }
+  ],
+  "anchors": []
+}
+

@@ -13,11 +13,15 @@ import {
   Manrope_600SemiBold,
   Manrope_700Bold,
 } from '@expo-google-fonts/manrope';
-import { Barometer, DeviceMotion, Magnetometer, Pedometer } from 'expo-sensors';
 import { pilotStoreMap, type StoreMap, type StoreMapAnchor, type StoreMapNode } from './navigation/storeMap';
 import { computePolylineForOrder, computeRouteOrder } from './navigation/routing';
-import { scanWifi, type WifiReading } from './navigation/wifi';
 import { planConfigs, type PlanId } from './navigation/houseFloorplan';
+import { ModelMap3D } from './navigation/ModelMap3D';
+import { IndoorPlan2D } from './render/IndoorPlan2D';
+import { useIndoorPositioning, type IndoorPositioningState } from './positioning/useIndoorPositioning';
+import { useIndoorNavigation } from './nav/useIndoorNavigation';
+
+const neueModel = require('./assets/wg.glb');
 
 type HouseholdRole = 'owner' | 'editor' | 'viewer';
 type HouseholdMember = {
@@ -64,47 +68,10 @@ type TierId = 'free' | 'pro' | 'family';
 type Locale = 'de' | 'en';
 type TabId = 'home' | 'list' | 'recipes' | 'nav' | 'plans';
 type SortMode = 'category' | 'aisle' | 'priority';
-type PdrState = {
-  steps: number;
-  heading: number;
-  gyroHeading: number;
-  magHeading: number;
-  floor: number;
-  pressure: number;
-  status: 'idle' | 'tracking' | 'denied';
-};
 type PdrPoint = { x: number; y: number };
 type NavNode = StoreMapNode;
-type MotionDebug = {
-  accelMag: number;
-  accelBaseline: number;
-  accelDiff: number;
-  stepThreshold: number;
-  stepLength: number;
-  lastStepAt: number | null;
-  lastIntervalMs: number;
-  isStationary: boolean;
-  stepSource: 'deviceMotion' | 'pedometer' | 'none';
-  deviceMotionLinAccMag: number;
-  pedometerSteps: number;
-  deviceSteps: number;
-};
-type SensorHealth = {
-  accel: { available: boolean | null; lastAt: number | null; error?: string };
-  gyro: { available: boolean | null; lastAt: number | null; error?: string };
-  mag: { available: boolean | null; lastAt: number | null; error?: string };
-  baro: { available: boolean | null; lastAt: number | null; error?: string };
-  deviceMotion: { available: boolean | null; lastAt: number | null; error?: string };
-  pedometer: { available: boolean | null; lastAt: number | null; error?: string; permission?: string };
-};
 
 type PlanTool = 'start' | 'measure' | 'anchor';
-type WifiFix = {
-  x: number;
-  y: number;
-  matched: number;
-  best?: WifiReading;
-};
 
 const FloorplanImageCanvas: React.FC<{
   source: any;
@@ -112,7 +79,8 @@ const FloorplanImageCanvas: React.FC<{
   path: PdrPoint[];
   current?: PdrPoint;
   onTapMeters?: (pMeters: PdrPoint, pImagePx: { x: number; y: number }) => void;
-}> = ({ source, imagePixelsPerMeter, path, current, onTapMeters }) => {
+  camera?: { follow?: boolean; zoom?: number; target?: PdrPoint | null };
+}> = ({ source, imagePixelsPerMeter, path, current, onTapMeters, camera }) => {
   const [layout, setLayout] = React.useState<{ w: number; h: number } | null>(null);
   const resolved = Image.resolveAssetSource(source);
   const imgW = resolved?.width ?? 1;
@@ -128,6 +96,13 @@ const FloorplanImageCanvas: React.FC<{
     y: offsetY + p.y * ppm * scale,
   });
 
+  const camZoom = clamp(camera?.zoom ?? 1, 1, 6);
+  const camFollow = camera?.follow ?? false;
+  const target = camFollow ? (camera?.target ?? current ?? null) : null;
+  const targetC = layout && target ? toContainer(target) : null;
+  const camTx = layout && targetC ? layout.w / 2 - camZoom * targetC.x : 0;
+  const camTy = layout && targetC ? layout.h / 2 - camZoom * targetC.y : 0;
+
   return (
     <View
       style={styles.planWrap}
@@ -139,44 +114,51 @@ const FloorplanImageCanvas: React.FC<{
           if (!layout) return;
           const x = e.nativeEvent.locationX;
           const y = e.nativeEvent.locationY;
-          const ix = Math.max(0, Math.min(imgW, (x - offsetX) / scale));
-          const iy = Math.max(0, Math.min(imgH, (y - offsetY) / scale));
+          const ux = (x - camTx) / camZoom;
+          const uy = (y - camTy) / camZoom;
+          const ix = Math.max(0, Math.min(imgW, (ux - offsetX) / scale));
+          const iy = Math.max(0, Math.min(imgH, (uy - offsetY) / scale));
           onTapMeters?.({ x: ix / ppm, y: iy / ppm }, { x: ix, y: iy });
         }}
       >
-        <Image source={source} style={styles.planImage} resizeMode="contain" />
-        <View pointerEvents="none" style={styles.planOverlay}>
-          {layout ? (
-            <>
-              {path.map((p, idx) => (
-                (() => {
+        <View
+          style={{
+            flex: 1,
+            transform: [{ scale: camZoom }, { translateX: camTx }, { translateY: camTy }],
+          }}
+        >
+          <Image source={source} style={styles.planImage} resizeMode="contain" />
+          <View pointerEvents="none" style={styles.planOverlay}>
+            {layout ? (
+              <>
+                {path.map((p, idx) => {
                   const c = toContainer(p);
                   return (
-                <View
-                  key={`p-${idx}`}
-                  style={[
-                    styles.planPathDot,
-                    { left: c.x - 2, top: c.y - 2 },
-                  ]}
-                />
+                    <View
+                      key={`p-${idx}`}
+                      style={[
+                        styles.planPathDot,
+                        { left: c.x - 2, top: c.y - 2 },
+                      ]}
+                    />
                   );
-                })()
-              ))}
-              {current ? (
-                (() => {
-                  const c = toContainer(current);
-                  return (
-                <View
-                  style={[
-                    styles.planCurrentDot,
-                    { left: c.x - 7, top: c.y - 7 },
-                  ]}
-                />
-                  );
-                })()
-              ) : null}
-            </>
-          ) : null}
+                })}
+                {current ? (
+                  (() => {
+                    const c = toContainer(current);
+                    return (
+                      <View
+                        style={[
+                          styles.planCurrentDot,
+                          { left: c.x - 7, top: c.y - 7 },
+                        ]}
+                      />
+                    );
+                  })()
+                ) : null}
+              </>
+            ) : null}
+          </View>
         </View>
       </Pressable>
     </View>
@@ -423,8 +405,10 @@ const FloorplanCanvas: React.FC<{
   onSelectNode?: (node: NavNode) => void;
   path?: PdrPoint[];
   current?: PdrPoint;
-}> = ({ nodes, routeOrder, visited, gridSize = 6, startId, onSelectNode, path = [], current }) => {
+  camera?: { follow?: boolean; zoom?: number; target?: PdrPoint | null };
+}> = ({ nodes, routeOrder, visited, gridSize = 6, startId, onSelectNode, path = [], current, camera }) => {
   const [cellSize, setCellSize] = React.useState(0);
+  const [container, setContainer] = React.useState<{ w: number; h: number } | null>(null);
   const cells = Array.from({ length: gridSize }, (_, row) =>
     Array.from({ length: gridSize }, (_, col) => {
       const node = nodes.find((n) => Math.floor(n.y) === row && Math.floor(n.x) === col);
@@ -444,92 +428,115 @@ const FloorplanCanvas: React.FC<{
       style={styles.floorGrid}
       onLayout={(e) => {
         const w = e.nativeEvent.layout.width;
+        const h = e.nativeEvent.layout.height;
+        setContainer({ w, h });
         setCellSize(w / gridSize);
       }}
     >
       {cellSize > 0 ? (
-        <View style={styles.floorOverlay} pointerEvents="none">
-          {path.map((p, idx) => {
-            if (idx === path.length - 1) return null;
-            const next = path[idx + 1];
-            const x1 = p.x * cellSize;
-            const y1 = p.y * cellSize;
-            const x2 = next.x * cellSize;
-            const y2 = next.y * cellSize;
-            const dx = x2 - x1;
-            const dy = y2 - y1;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            const angle = Math.atan2(dy, dx);
-            return (
-              <React.Fragment key={`${p.x}-${p.y}-${idx}`}>
-                <View
-                  style={[
-                    styles.floorPathLine,
-                    {
-                      width: dist,
-                      left: x1,
-                      top: y1,
-                      transform: [{ translateX: -dist / 2 }, { rotate: `${angle}rad` }],
-                    },
-                  ]}
-                />
-                <View style={[styles.floorPathDot, { left: x1 - 4, top: y1 - 4 }]} />
-              </React.Fragment>
-            );
-          })}
-          {current ? (
+        (() => {
+          const camZoom = clamp(camera?.zoom ?? 1, 1, 6);
+          const camFollow = camera?.follow ?? false;
+          const target = camFollow ? (camera?.target ?? current ?? null) : null;
+          const cw = container?.w ?? cellSize * gridSize;
+          const ch = container?.h ?? cellSize * gridSize;
+          const camTx = target ? cw / 2 - camZoom * (target.x * cellSize) : 0;
+          const camTy = target ? ch / 2 - camZoom * (target.y * cellSize) : 0;
+
+          return (
             <View
-              style={[
-                styles.floorCurrentDot,
-                {
-                  left: current.x * cellSize - 8,
-                  top: current.y * cellSize - 8,
-                },
-              ]}
-            />
-          ) : null}
-        </View>
-      ) : null}
-      {cells.map((row, rIdx) => (
-        <View key={rIdx} style={styles.floorRow}>
-          {row.map((cell, cIdx) => {
-            const bg = cell.isCurrent
-              ? colors.accent
-              : cell.isVisited
-              ? '#DCEEE1'
-              : cell.isPath
-              ? colors.accentSoft
-              : cell.isRoute
-              ? 'rgba(217,118,82,0.18)'
-              : cell.node
-              ? '#FFF7ED'
-              : '#E9DFD6';
-            return (
-              <Pressable
-                key={`${rIdx}-${cIdx}`}
-                style={[styles.floorCell, { backgroundColor: bg }]}
-                disabled={!cell.node}
-                onPress={() => cell.node && onSelectNode?.(cell.node)}
-              >
-                {cell.node ? (
-                  <View style={styles.floorNode}>
-                    <Text style={styles.floorNodeIcon}>
-                      {cell.isStart
-                        ? '⭐'
-                        : cell.isEntry
-                        ? '🟢'
-                        : cell.isExit
-                        ? '🏁'
-                        : storeSections.find((s) => s.id === cell.node?.sectionId)?.icon || '📍'}
-                    </Text>
-                    <Text style={styles.floorNodeLabel}>{cell.node.label}</Text>
-                  </View>
+              style={{
+                width: cellSize * gridSize,
+                height: cellSize * gridSize,
+                transform: [{ scale: camZoom }, { translateX: camTx }, { translateY: camTy }],
+              }}
+            >
+              <View style={styles.floorOverlay} pointerEvents="none">
+                {path.map((p, idx) => {
+                  if (idx === path.length - 1) return null;
+                  const next = path[idx + 1];
+                  const x1 = p.x * cellSize;
+                  const y1 = p.y * cellSize;
+                  const x2 = next.x * cellSize;
+                  const y2 = next.y * cellSize;
+                  const dx = x2 - x1;
+                  const dy = y2 - y1;
+                  const dist = Math.sqrt(dx * dx + dy * dy);
+                  const angle = Math.atan2(dy, dx);
+                  return (
+                    <React.Fragment key={`${p.x}-${p.y}-${idx}`}>
+                      <View
+                        style={[
+                          styles.floorPathLine,
+                          {
+                            width: dist,
+                            left: x1,
+                            top: y1,
+                            transform: [{ translateX: -dist / 2 }, { rotate: `${angle}rad` }],
+                          },
+                        ]}
+                      />
+                      <View style={[styles.floorPathDot, { left: x1 - 4, top: y1 - 4 }]} />
+                    </React.Fragment>
+                  );
+                })}
+                {current ? (
+                  <View
+                    style={[
+                      styles.floorCurrentDot,
+                      {
+                        left: current.x * cellSize - 8,
+                        top: current.y * cellSize - 8,
+                      },
+                    ]}
+                  />
                 ) : null}
-              </Pressable>
-            );
-          })}
-        </View>
-      ))}
+              </View>
+
+              {cells.map((row, rIdx) => (
+                <View key={rIdx} style={styles.floorRow}>
+                  {row.map((cell, cIdx) => {
+                    const bg = cell.isCurrent
+                      ? colors.accent
+                      : cell.isVisited
+                      ? '#DCEEE1'
+                      : cell.isPath
+                      ? colors.accentSoft
+                      : cell.isRoute
+                      ? 'rgba(217,118,82,0.18)'
+                      : cell.node
+                      ? '#FFF7ED'
+                      : '#E9DFD6';
+                    return (
+                      <Pressable
+                        key={`${rIdx}-${cIdx}`}
+                        style={[styles.floorCell, { backgroundColor: bg, width: cellSize, height: cellSize }]}
+                        disabled={!cell.node}
+                        onPress={() => cell.node && onSelectNode?.(cell.node)}
+                      >
+                        {cell.node ? (
+                          <View style={styles.floorNode}>
+                            <Text style={styles.floorNodeIcon}>
+                              {cell.isStart
+                                ? '⭐'
+                                : cell.isEntry
+                                ? '🟢'
+                                : cell.isExit
+                                ? '🏁'
+                                : storeSections.find((s) => s.id === cell.node?.sectionId)?.icon || '📍'}
+                            </Text>
+                            <Text style={styles.floorNodeLabel}>{cell.node.label}</Text>
+                          </View>
+                        ) : null}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              ))}
+            </View>
+          );
+        })()
+      ) : null}
     </View>
   );
 };
@@ -1049,34 +1056,22 @@ const NavigationSection: React.FC<{
   visited: string[];
   form: { label: string; section: string; row: string; col: string };
   setForm: (f: Partial<{ label: string; section: string; row: string; col: string }>) => void;
-  pdrState: PdrState;
+  positioning: IndoorPositioningState;
   pdrActive: boolean;
   togglePdr: () => void;
   startNodeId: string;
   onSelectStart: (id: string) => void;
-  pdrPath: PdrPoint[];
-  motionDebug: MotionDebug;
-  sensorHealth: SensorHealth;
-  wifiAnchor: StoreMapAnchor | null;
-  wifiStatus: 'mock' | 'live' | 'off';
-  wifiNote?: string | null;
-  wifiLastScanAt?: number | null;
-  wifiLastCount?: number;
-  wifiFix?: WifiFix | null;
-  onMockAnchor: (anchor: StoreMapAnchor) => void;
   onScanWifi?: () => void;
-  onUseBestWifiAsAnchor?: () => void;
-  wifiConfidence: number;
+  wifiCorrections?: boolean;
+  onToggleWifiCorrections?: (enabled: boolean) => void;
   strideScale?: number;
   onAdjustStrideScale?: (delta: number) => void;
   onResetHeading?: () => void;
   testMode?: boolean;
-  pdrConfidence: 'good' | 'ok' | 'low';
   onRecenter: () => void;
   mapMode: 'pilot' | 'house';
   onChangeMapMode: (m: 'pilot' | 'house') => void;
-  planId: 'house' | 'neue';
-  onChangePlanId: (id: 'house' | 'neue') => void;
+  planId: 'neue';
   planImage: any;
   planImagePixelsPerMeter: number;
   setPlanImagePixelsPerMeter: (n: number) => void;
@@ -1104,36 +1099,21 @@ const NavigationSection: React.FC<{
   optimiseRoute,
   routeOrder,
   visited,
-  form,
-  setForm,
-  pdrState,
+  positioning,
   pdrActive,
   togglePdr,
   startNodeId,
   onSelectStart,
-  pdrPath,
-  motionDebug,
-  sensorHealth,
-  wifiAnchor,
-  wifiStatus,
-  wifiNote,
-  wifiLastScanAt,
-  wifiLastCount,
-  wifiFix,
-  onMockAnchor,
   onScanWifi,
-  onUseBestWifiAsAnchor,
-  wifiConfidence,
+  wifiCorrections,
+  onToggleWifiCorrections,
   strideScale,
   onAdjustStrideScale,
   onResetHeading,
-  testMode = false,
-  pdrConfidence,
   onRecenter,
   mapMode,
   onChangeMapMode,
   planId,
-  onChangePlanId,
   planImage,
   planImagePixelsPerMeter,
   setPlanImagePixelsPerMeter,
@@ -1153,451 +1133,171 @@ const NavigationSection: React.FC<{
   setPlanCalMeters,
   onPlanTap,
 }) => {
-  const pending = items.filter((i) => i.status === 'pending');
-  const done = items.filter((i) => i.status === 'done');
-  const matched = pending
-    .map((it) => {
-      const section = storeSections.find((s) =>
-        s.items.some((name) => name.toLowerCase() === it.name.toLowerCase()),
-      );
-      return section ? { item: it, section } : null;
-    })
-    .filter(Boolean) as { item: ShoppingItem; section: StoreSection }[];
-
-  const orderedSections = useMemo(() => {
-    const unique: StoreSection[] = [];
-    matched.forEach(({ section }) => {
-      if (!unique.some((s) => s.id === section.id)) {
-        unique.push(section);
-      }
-    });
-    return unique.sort((a, b) => a.aisle - b.aisle);
-  }, [matched]);
-
-  const estimatedMinutes = Math.max(3, orderedSections.length * 2);
-  const doneSections = useMemo(() => {
-    const found: StoreSection[] = [];
-    done.forEach((it) => {
-      const section = storeSections.find((s) =>
-        s.items.some((name) => name.toLowerCase() === it.name.toLowerCase()),
-      );
-      if (section && !found.some((s) => s.id === section.id)) {
-        found.push(section);
-      }
-    });
-    return found;
-  }, [done]);
-  const progress =
-    orderedSections.length + doneSections.length === 0 ? 0 : doneSections.length / (orderedSections.length + doneSections.length);
-  const lastStepAgoSec = motionDebug.lastStepAt ? (Date.now() - motionDebug.lastStepAt) / 1000 : null;
-  const cadencePerMin =
-    motionDebug.lastIntervalMs > 0 ? Math.round(60000 / motionDebug.lastIntervalMs) : 0;
-  const stepPulse = lastStepAgoSec !== null && lastStepAgoSec < 0.6;
-  const sensorLabel = (ok: boolean | null) => (ok === null ? '?' : ok ? 'ok' : 'no');
-  const ageSec = (t: number | null) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s` : '—');
-  const wifiAge = wifiLastScanAt ? `${((Date.now() - wifiLastScanAt) / 1000).toFixed(1)}s` : '—';
+  const [mapFollow, setMapFollow] = React.useState(true);
+  const [mapZoom, setMapZoom] = React.useState(2);
+  const [mapView, setMapView] = React.useState<'3d' | '2d'>('2d');
+  const [mapRotate, setMapRotate] = React.useState(true);
+  const [mapBearingDeg, setMapBearingDeg] = React.useState(0);
+  const [freeTarget, setFreeTarget] = React.useState<PdrPoint | null>(null);
+  const [navOn, setNavOn] = React.useState(false);
+  const [destinationId, setDestinationId] = React.useState<string | null>(null);
+  const [panel, setPanel] = React.useState<'route' | 'positioning' | 'setup'>('route');
+  const pendingCount = items.filter((i) => i.status === 'pending').length;
   const gridSize = storeMap.gridSize;
-  const anchors: StoreMapAnchor[] = storeMap.anchors ?? [];
+  const allNodes = useMemo(() => [...storeMap.nodes, ...customNodes], [storeMap.nodes, customNodes]);
 
-  const findFreeSlot = () => {
-    const occupied = [...storeMap.nodes, ...customNodes].map((n) => `${Math.floor(n.y)}-${Math.floor(n.x)}`);
-    for (let r = 0; r < gridSize; r += 1) {
-      for (let c = 0; c < gridSize; c += 1) {
-        if (!occupied.includes(`${r}-${c}`)) {
-          return { row: r, col: c };
-        }
-      }
-    }
-    return { row: 0, col: 0 };
-  };
+  const currentPose = positioning.pose;
+  const pdrPath = positioning.path;
+  const isHouse = mapMode === 'house';
+  const mapTarget = useMemo(() => {
+    if (currentPose) return { x: currentPose.x, y: currentPose.y };
+    const last = pdrPath[pdrPath.length - 1];
+    if (last) return last;
+    const start = allNodes.find((n) => n.id === startNodeId);
+    return start ? ({ x: start.x, y: start.y } as PdrPoint) : null;
+  }, [allNodes, currentPose, pdrPath, startNodeId]);
+  const planResolved = useMemo(() => (isHouse ? Image.resolveAssetSource(planImage) : null), [isHouse, planImage]);
+  const planMeters = useMemo(() => {
+    const ppm = Math.max(0.0001, planImagePixelsPerMeter);
+    return {
+      width: (planResolved?.width ?? 1) / ppm,
+      height: (planResolved?.height ?? 1) / ppm,
+    };
+  }, [planResolved, planImagePixelsPerMeter]);
 
-  const quickSections = [
-    { label: 'Milchprodukte', section: 'dairy' },
-    { label: 'Obst & Gemüse', section: 'produce' },
-    { label: 'Brot', section: 'bakery' },
-    { label: 'Proteine', section: 'protein' },
-  ];
+  const poiNodes = useMemo(() => storeMap.nodes.filter((n) => n.type === 'poi'), [storeMap.nodes]);
+  const destinationNode = useMemo(
+    () => (destinationId ? storeMap.nodes.find((n) => n.id === destinationId) ?? null : null),
+    [destinationId, storeMap.nodes],
+  );
+  const nav = useIndoorNavigation({
+    enabled: !!destinationId,
+    map: storeMap,
+    current: currentPose
+      ? { x: currentPose.x, y: currentPose.y }
+      : mapTarget
+      ? { x: mapTarget.x, y: mapTarget.y }
+      : null,
+    destinationId,
+    reroute: { offRouteMeters: 2.2, persistMs: navOn ? 3000 : 1e9 },
+  });
+
+  const cameraTarget = mapFollow ? mapTarget : (freeTarget ?? mapTarget);
+  const onCameraChange = React.useCallback(
+    (patch: { follow?: boolean; zoom?: number; target?: { x: number; y: number } | null; rotationDeg?: number; bearingDeg?: number }) => {
+      if (patch.zoom !== undefined) setMapZoom((_) => clamp(patch.zoom ?? 2, 1, 6));
+      if (patch.rotationDeg !== undefined) setMapBearingDeg(patch.rotationDeg ?? 0);
+      if (patch.bearingDeg !== undefined) setMapBearingDeg(patch.bearingDeg ?? 0);
+      if (patch.target) setFreeTarget({ x: patch.target.x, y: patch.target.y });
+      if (patch.follow === false) setMapFollow(false);
+    },
+    [],
+  );
 
   return (
-    <Section
-      title="Markt-Navigation"
-      subtitle="Eigener Floorplan, optimierte Route. Modern & klar."
-    >
-      <View style={styles.navInfoCard}>
-        <View>
-          <Text style={styles.sectionTitle}>Navigation</Text>
-          <Text style={styles.metaMuted}>
-            {mapMode === 'house' ? 'House Floorplan Mode' : `${orderedSections.length} Stopps • ~${estimatedMinutes} min`}
-          </Text>
-        </View>
-        <View style={styles.navPills}>
-          <Badge label={mapMode === 'house' ? 'Plan' : `${pending.length} offen`} tone="accent" />
-          <Badge label={mapMode === 'house' ? 'Free Move' : `${customNodes.length} Gänge`} tone="muted" />
-        </View>
-      </View>
-      <View style={styles.listControlRow}>
-        <View style={styles.segment}>
-          {(['pilot', 'house'] as const).map((m) => (
-            <Pressable
-              key={m}
-              style={[styles.segmentButton, mapMode === m && styles.segmentButtonActive]}
-              onPress={() => onChangeMapMode(m)}
-            >
-              <Text style={[styles.metaText, mapMode === m && { color: colors.ink }]}>
-                {m === 'pilot' ? 'Pilot Store' : 'House Plan'}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-      </View>
-      <View style={styles.pdrCard}>
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-          <Text style={styles.sectionTitle}>Sensor-Tracking</Text>
-          <Pressable style={[styles.primaryButton, { paddingVertical: 8 }]} onPress={togglePdr}>
-            <Text style={styles.primaryButtonText}>{pdrActive ? 'Stop' : 'Start'}</Text>
-          </Pressable>
-        </View>
-        <View style={styles.pdrRow}>
-          <Badge label={`Steps ${pdrState.steps}`} tone="accent" />
-          <Badge label={`Heading ${pdrState.heading.toFixed(0)}°`} />
-          <Badge label={`Floor ~${pdrState.floor}`} />
-          <Badge label={pdrState.status === 'tracking' ? 'Live' : pdrState.status === 'denied' ? 'Denied' : 'Idle'} tone={pdrState.status === 'tracking' ? 'success' : 'muted'} />
-          <Badge label={`Pfad ${pdrPath.length}`} />
-          <Badge label={`Wi-Fi ${wifiStatus}${wifiAnchor ? ` • ${wifiAnchor.label}` : ''}`} />
-          <Badge label={`Conf ${Math.round(wifiConfidence * 100)}%`} />
-          <Badge label={`PDR ${pdrConfidence}`} />
-          <Badge label={`OS ${Platform.OS}`} />
-        </View>
-        <View style={styles.pdrRow}>
-          <Badge label={`Wi‑Fi scan ${wifiAge}`} />
-          <Badge label={`APs ${wifiLastCount ?? 0}`} />
-          <Badge label={`match ${wifiFix?.matched ?? 0}`} />
-          {wifiFix?.best ? <Badge label={`best ${wifiFix.best.level}dBm`} tone="accent" /> : <Badge label="best —" />}
-        </View>
-        <View style={styles.pdrRow}>
-          <Badge label={`DevMotion ${sensorLabel(sensorHealth.deviceMotion.available)} ${ageSec(sensorHealth.deviceMotion.lastAt)}`} />
-          <Badge
-            label={`Pedom ${sensorLabel(sensorHealth.pedometer.available)} ${ageSec(sensorHealth.pedometer.lastAt)}${
-              sensorHealth.pedometer.permission ? ` • ${sensorHealth.pedometer.permission}` : ''
-            }`}
-          />
-          <Badge label={`Mag ${sensorLabel(sensorHealth.mag.available)} ${ageSec(sensorHealth.mag.lastAt)}`} />
-          <Badge label={`Baro ${sensorLabel(sensorHealth.baro.available)} ${ageSec(sensorHealth.baro.lastAt)}`} />
-        </View>
-        <View style={styles.pdrRow}>
-          <Badge label={`Att ${pdrState.gyroHeading.toFixed(0)}°`} />
-          <Badge label={`Mag ${pdrState.magHeading.toFixed(0)}°`} />
-          <Badge label={`src ${motionDebug.stepSource}`} />
-          <Badge label={`ped ${motionDebug.pedometerSteps}`} />
-          <Badge label={`dev ${motionDebug.deviceSteps}`} />
-          <Badge label={`a ${motionDebug.accelMag.toFixed(2)}`} />
-          <Badge label={`base ${motionDebug.accelBaseline.toFixed(2)}`} />
-          <Badge
-            label={`diff ${motionDebug.accelDiff.toFixed(2)}`}
-            tone={motionDebug.accelDiff > motionDebug.stepThreshold ? 'accent' : 'muted'}
-          />
-          <Badge label={`th ${motionDebug.stepThreshold.toFixed(2)}`} />
-          <Badge label={`len ${motionDebug.stepLength.toFixed(2)}m`} />
-          <Badge label={cadencePerMin ? `cad ${cadencePerMin}/min` : 'cad —'} />
-          <Badge
-            label={stepPulse ? 'STEP' : lastStepAgoSec !== null ? `${lastStepAgoSec.toFixed(1)}s` : 'no step'}
-            tone={stepPulse ? 'success' : 'muted'}
-          />
-          <Badge label={motionDebug.isStationary ? 'Still' : 'Moving'} tone={motionDebug.isStationary ? 'muted' : 'success'} />
-        </View>
-        {sensorHealth.deviceMotion.error ||
-        sensorHealth.pedometer.error ||
-        sensorHealth.mag.error ||
-        sensorHealth.baro.error ? (
-          <Text style={styles.metaMuted}>
-            Sensor error:{' '}
-            {[
-              sensorHealth.deviceMotion.error,
-              sensorHealth.pedometer.error,
-              sensorHealth.mag.error,
-              sensorHealth.baro.error,
-            ]
-              .filter(Boolean)
-              .join(' | ')}
-          </Text>
-        ) : null}
-        {wifiNote ? <Text style={styles.metaMuted}>Wi‑Fi: {wifiNote}</Text> : null}
-        <Text style={styles.metaMuted}>Step wenn diff &gt; th und Δt &gt; 250ms.</Text>
-        <View style={styles.pdrRow}>
-          {anchors.map((anchor) => (
-            <Pressable key={anchor.bssid} style={styles.ghostButton} onPress={() => onMockAnchor(anchor)}>
-              <Ionicons name="wifi" size={16} color={colors.accent} />
-              <Text style={styles.metaText}>{anchor.label}</Text>
-            </Pressable>
-          ))}
-          {onScanWifi ? (
-            <Pressable key="wifi-auto" style={styles.ghostButton} onPress={onScanWifi}>
-              <Ionicons name="wifi" size={16} color={colors.accent} />
-              <Text style={styles.metaText}>Auto Wi-Fi</Text>
-            </Pressable>
-          ) : null}
-          {onUseBestWifiAsAnchor ? (
-            <Pressable
-              key="wifi-cal"
-              style={styles.ghostButton}
-              onPress={onUseBestWifiAsAnchor}
-              disabled={!wifiFix?.best}
-            >
-              <Ionicons name="pin" size={16} color={colors.accent} />
-              <Text style={styles.metaText}>{wifiFix?.best ? 'Use best AP as anchor' : 'Scan first'}</Text>
-            </Pressable>
-          ) : null}
-          {onAdjustStrideScale ? (
-            <Pressable key="stride-minus" style={styles.ghostButton} onPress={() => onAdjustStrideScale(-0.05)}>
-              <Ionicons name="remove" size={16} color={colors.accent} />
-              <Text style={styles.metaText}>Stride</Text>
-            </Pressable>
-          ) : null}
-          {typeof strideScale === 'number' ? <Badge label={`x${strideScale.toFixed(2)}`} tone="accent" /> : null}
-          {onAdjustStrideScale ? (
-            <Pressable key="stride-plus" style={styles.ghostButton} onPress={() => onAdjustStrideScale(0.05)}>
-              <Ionicons name="add" size={16} color={colors.accent} />
-              <Text style={styles.metaText}>Stride</Text>
-            </Pressable>
-          ) : null}
-          {onResetHeading ? (
-            <Pressable key="heading-reset" style={styles.ghostButton} onPress={onResetHeading}>
-              <Ionicons name="compass" size={16} color={colors.accent} />
-              <Text style={styles.metaText}>Align heading</Text>
-            </Pressable>
-          ) : null}
-          <Pressable
-            style={styles.ghostButton}
-            onPress={onRecenter}
-          >
-            <Ionicons name="refresh" size={16} color={colors.accent} />
-            <Text style={styles.metaText}>Recenter</Text>
-          </Pressable>
-        </View>
-      </View>
-
-      {!testMode && (
-        <>
-          <View style={styles.progressBar}>
-            <View style={[styles.progressFill, { width: `${Math.min(100, Math.round(progress * 100))}%` }]} />
-          </View>
-          <Text style={styles.metaMuted}>
-            Fortschritt: {Math.min(100, Math.round(progress * 100))}% (abhängig von abgehakten Artikeln)
-          </Text>
-        </>
-      )}
-
-      {!testMode && mapMode !== 'house' && (
-        <View style={styles.glassCard}>
-          <Text style={styles.sectionTitle}>Floorplan anpassen</Text>
-          <Text style={styles.metaMuted}>Füge Gänge hinzu und platziere sie im Raster.</Text>
-          <View style={styles.quickChipRow}>
-            {quickSections.map((qs) => (
-              <Pressable
-                key={qs.section}
-                style={styles.quickChip}
-                onPress={() => {
-                  const slot = findFreeSlot();
-                  addNode(qs.label, qs.section, slot.row, slot.col);
-                }}
-              >
-                <Text style={styles.quickChipText}>{qs.label}</Text>
-              </Pressable>
-            ))}
-          </View>
-          <View style={styles.floorForm}>
-            <TextInput
-              style={[styles.searchInput, styles.floorInput]}
-              placeholder="Label (z.B. Milch)"
-              value={form.label}
-              onChangeText={(v) => setForm({ label: v })}
-            />
-            <TextInput
-              style={[styles.searchInput, styles.floorInput]}
-              placeholder="Section ID (z.B. dairy)"
-              value={form.section}
-              onChangeText={(v) => setForm({ section: v })}
-            />
-            <View style={[styles.row, { gap: 8 }]}>
-              <TextInput
-                style={[styles.searchInput, styles.floorInputSmall]}
-                placeholder={`Row (0-${gridSize - 1})`}
-                keyboardType="numeric"
-                value={form.row}
-                onChangeText={(v) => setForm({ row: v })}
-              />
-              <TextInput
-                style={[styles.searchInput, styles.floorInputSmall]}
-                placeholder={`Col (0-${gridSize - 1})`}
-                keyboardType="numeric"
-                value={form.col}
-                onChangeText={(v) => setForm({ col: v })}
-              />
-            </View>
-            <View style={[styles.row, { gap: 8, marginTop: 6 }]}>
-              <Pressable
-                style={styles.primaryButton}
-                onPress={() => {
-                  const r = Math.max(0, Math.min(gridSize - 1, Number(form.row) || 0));
-                  const c = Math.max(0, Math.min(gridSize - 1, Number(form.col) || 0));
-                  addNode(form.label || 'Gang', form.section || 'custom', r, c);
-                }}
-              >
-                <Ionicons name="add" size={18} color={colors.text} />
-                <Text style={styles.primaryButtonText}>Gang hinzufügen</Text>
-              </Pressable>
-              <Pressable style={styles.ghostButton} onPress={clearNodes}>
-                <Ionicons name="trash-outline" size={18} color={colors.muted} />
-                <Text style={styles.metaText}>Zurücksetzen</Text>
-              </Pressable>
-            </View>
-          </View>
-        </View>
-      )}
-
-      {!testMode && mapMode !== 'house' && (
-        <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={optimiseRoute}>
-          <Ionicons name="navigate" size={18} color={colors.text} />
-          <Text style={styles.primaryButtonText}>Route optimieren</Text>
-        </Pressable>
-      )}
-
-      <View style={styles.mapLegend}>
-        <Text style={styles.metaMuted}>
-          {mapMode === 'house' ? 'Tippe auf den Plan, um den Start zu setzen.' : 'Tippe auf einen Punkt, um den Start zu setzen.'}
-        </Text>
-        <Badge label={`Start: ${startNodeId}`} />
-        {wifiAnchor ? <Badge label={`Anchor: ${wifiAnchor.label}`} tone="accent" /> : null}
-      </View>
-
-      {mapMode === 'house' ? (
-        <>
-          <View style={styles.listControlRow}>
-            <View style={styles.segment}>
-              {(['house', 'neue'] as const).map((id) => (
-                <Pressable
-                  key={id}
-                  style={[styles.segmentButton, planId === id && styles.segmentButtonActive]}
-                  onPress={() => onChangePlanId(id)}
-                >
-                  <Text style={[styles.metaText, planId === id && { color: colors.ink }]}>
-                    {id === 'house' ? 'House' : 'Neue'}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          </View>
-          <View style={styles.listControlRow}>
-            <View style={styles.segment}>
-              {(['start', 'measure', 'anchor'] as const).map((t) => (
-                <Pressable
-                  key={t}
-                  style={[styles.segmentButton, planTool === t && styles.segmentButtonActive]}
-                  onPress={() => setPlanTool(t)}
-                >
-                  <Text style={[styles.metaText, planTool === t && { color: colors.ink }]}>
-                    {t === 'start' ? 'Start' : t === 'measure' ? 'Measure' : 'Anchor'}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-            {planTool !== 'start' ? (
-              <Pressable
-                style={styles.ghostButton}
-                onPress={() => {
-                  setPlanMeasureA(null);
-                  setPlanMeasureB(null);
-                }}
-              >
-                <Ionicons name="trash-outline" size={16} color={colors.muted} />
-                <Text style={styles.metaText}>Clear</Text>
-              </Pressable>
+    <Section title="Indoor Navigation" subtitle="Tap to set start, pick a POI, start navigation.">
+      <View style={styles.glassCard}>
+        <View style={styles.listControlRow}>
+          <Text style={styles.sectionTitle}>Map</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            {isHouse ? (
+              <View style={styles.segment}>
+                {(['3d', '2d'] as const).map((v) => (
+                  <Pressable
+                    key={v}
+                    style={[styles.segmentButton, mapView === v && styles.segmentButtonActive]}
+                    onPress={() => setMapView(v)}
+                  >
+                    <Text style={[styles.metaText, mapView === v && { color: colors.ink }]}>{v === '3d' ? '3D' : '2D'}</Text>
+                  </Pressable>
+                ))}
+              </View>
             ) : null}
-          </View>
-          <View style={styles.planControls}>
-            <Text style={styles.metaText}>Scale</Text>
-            <TextInput
-              style={[styles.searchInput, styles.floorInputSmall]}
-              placeholder="img px / m"
-              keyboardType="numeric"
-              value={String(Math.round(planImagePixelsPerMeter))}
-              onChangeText={(v) => setPlanImagePixelsPerMeter(Number(v) || 1)}
-            />
-            {planId === 'neue' ? <Badge label="1:74" tone="accent" /> : null}
+            <View style={styles.inlineSwitch}>
+              <Text style={styles.metaText}>Follow</Text>
+              <Switch
+                value={mapFollow}
+                onValueChange={(v) => {
+                  setMapFollow(v);
+                  if (v) setFreeTarget(null);
+                }}
+              />
+            </View>
+            <View style={styles.inlineSwitch}>
+              <Text style={styles.metaText}>Rotate</Text>
+              <Switch value={mapRotate} onValueChange={setMapRotate} />
+            </View>
+            <Pressable style={styles.ghostButton} onPress={() => setMapZoom((z) => clamp(Math.round((z - 0.2) * 10) / 10, 1, 6))}>
+              <Ionicons name="remove" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Zoom</Text>
+            </Pressable>
+            <Badge label={`x${mapZoom.toFixed(1)}`} tone="accent" />
+            <Pressable style={styles.ghostButton} onPress={() => setMapZoom((z) => clamp(Math.round((z + 0.2) * 10) / 10, 1, 6))}>
+              <Ionicons name="add" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Zoom</Text>
+            </Pressable>
             <Pressable
               style={styles.ghostButton}
               onPress={() => {
-                setPlanCalA(null);
-                setPlanCalB(null);
-                setPlanCalMeters('');
-                if (planDefaultImagePixelsPerMeter) {
-                  setPlanImagePixelsPerMeter(planDefaultImagePixelsPerMeter);
-                }
+                setMapZoom(2);
+                setMapFollow(true);
+                setMapRotate(true);
               }}
             >
-              <Ionicons name="close" size={16} color={colors.muted} />
-              <Text style={styles.metaText}>Reset</Text>
+              <Ionicons name="refresh" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Reset view</Text>
             </Pressable>
           </View>
-          {planTool === 'measure' && (planMeasureA || planMeasureB) ? (
-            <View style={styles.planControls}>
-              <Badge label={`A ${planMeasureA ? `${Math.round(planMeasureA.x)},${Math.round(planMeasureA.y)}` : '—'}`} />
-              <Badge label={`B ${planMeasureB ? `${Math.round(planMeasureB.x)},${Math.round(planMeasureB.y)}` : '—'}`} />
-              {planMeasureA && planMeasureB ? (
-                <Badge
-                  label={`Δ ${(Math.hypot(planMeasureB.x - planMeasureA.x, planMeasureB.y - planMeasureA.y) / Math.max(0.0001, planImagePixelsPerMeter)).toFixed(2)} m`}
-                  tone="accent"
-                />
-              ) : (
-                <Text style={styles.metaMuted}>Tap point {planMeasureA ? 'B' : 'A'}</Text>
-              )}
-            </View>
+        </View>
+
+        <View style={styles.pdrRow}>
+          <View style={styles.inlineSwitch}>
+            <Text style={styles.metaText}>PDR</Text>
+            <Switch value={pdrActive} onValueChange={togglePdr} />
+          </View>
+          <Pressable style={styles.ghostButton} onPress={onRecenter}>
+            <Ionicons name="locate-outline" size={16} color={colors.accent} />
+            <Text style={styles.metaText}>Recenter</Text>
+          </Pressable>
+          {onResetHeading ? (
+            <Pressable style={styles.ghostButton} onPress={onResetHeading}>
+              <Ionicons name="compass" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Align</Text>
+            </Pressable>
           ) : null}
-          {planId === 'house' ? (
-            <>
-              <Text style={styles.metaMuted}>
-                Kalibrieren: Tippe 2 Punkte auf dem Plan, gib die reale Distanz (m) ein, dann „Apply“.
-              </Text>
-              <View style={styles.planControls}>
-                <Badge label={`A ${planCalA ? `${Math.round(planCalA.x)},${Math.round(planCalA.y)}` : '—'}`} />
-                <Badge label={`B ${planCalB ? `${Math.round(planCalB.x)},${Math.round(planCalB.y)}` : '—'}`} />
-                {planCalA && planCalB ? (
-                  <Badge
-                    label={`d ${(Math.hypot(planCalB.x - planCalA.x, planCalB.y - planCalA.y) / Math.max(1, planImagePixelsPerMeter)).toFixed(2)} m`}
-                    tone="accent"
-                  />
-                ) : null}
-                <TextInput
-                  style={[styles.searchInput, styles.floorInputSmall]}
-                  placeholder="meters"
-                  keyboardType="numeric"
-                  value={planCalMeters}
-                  onChangeText={setPlanCalMeters}
-                />
-                <Pressable
-                  style={styles.primaryButton}
-                  onPress={() => {
-                    if (!planCalA || !planCalB) return;
-                    const meters = Number(planCalMeters);
-                    if (!Number.isFinite(meters) || meters <= 0.01) return;
-                    const dPx = Math.hypot(planCalB.x - planCalA.x, planCalB.y - planCalA.y);
-                    const ppm = Math.max(1, dPx / meters);
-                    setPlanImagePixelsPerMeter(ppm);
-                  }}
-                >
-                  <Ionicons name="checkmark" size={18} color={colors.text} />
-                  <Text style={styles.primaryButtonText}>Apply</Text>
-                </Pressable>
-              </View>
-            </>
-          ) : (
-            <Text style={styles.metaMuted}>Scale ist hardcoded über 1:74 (PNG @ 72dpi).</Text>
-          )}
-          <FloorplanImageCanvas
+        </View>
+      </View>
+
+      {isHouse ? (
+        mapView === '3d' ? (
+          <ModelMap3D
+            style={[styles.planWrap, styles.planWrap3d]}
+            model={neueModel}
+            planMeters={planMeters}
+            target={cameraTarget}
+            follow={mapFollow}
+            zoom={mapZoom}
+            headingDeg={currentPose?.headingDeg ?? 0}
+            rotateWithHeading={mapRotate}
+            bearingDeg={mapBearingDeg}
+            onCameraChange={onCameraChange}
+            route={nav.route?.path.points ?? null}
+            destination={destinationNode ? { x: destinationNode.x, y: destinationNode.y } : null}
+          />
+        ) : (
+          <IndoorPlan2D
+            style={styles.planWrap}
             source={planImage}
             imagePixelsPerMeter={planImagePixelsPerMeter}
-            path={pdrPath}
-            current={pdrPath[pdrPath.length - 1]}
+            current={currentPose ? { x: currentPose.x, y: currentPose.y } : null}
+            raw={positioning.rawPose ? { x: positioning.rawPose.x, y: positioning.rawPose.y } : null}
+            headingDeg={currentPose?.headingDeg ?? 0}
+            route={nav.route?.path.points ?? null}
+            destinationId={destinationId}
+            pois={poiNodes.map((p) => ({ id: p.id, label: p.label, x: p.x, y: p.y }))}
+            onSelectPoi={(id) => setDestinationId(id)}
+            camera={{ follow: mapFollow, zoom: mapZoom, target: cameraTarget, rotationDeg: mapBearingDeg }}
+            onCameraChange={onCameraChange}
             onTapMeters={(p, px) => {
               if (planTool === 'measure') {
                 if (!planMeasureA) setPlanMeasureA(px);
@@ -1615,10 +1315,10 @@ const NavigationSection: React.FC<{
               onPlanTap(p, px);
             }}
           />
-        </>
+        )
       ) : (
         <FloorplanCanvas
-          nodes={[...storeMap.nodes, ...customNodes]}
+          nodes={allNodes}
           gridSize={gridSize}
           routeOrder={routeOrder}
           visited={visited}
@@ -1626,41 +1326,346 @@ const NavigationSection: React.FC<{
           onSelectNode={(node) => onSelectStart(node.id)}
           path={pdrPath}
           current={pdrPath[pdrPath.length - 1]}
+          camera={{ follow: mapFollow, zoom: mapZoom, target: cameraTarget }}
         />
       )}
 
-      {!testMode && mapMode !== 'house' && (
-        <View style={styles.routeSteps}>
-          {orderedSections.map((section, idx) => {
-            const sectionItems = matched.filter((m) => m.section.id === section.id).map((m) => m.item.name);
-            return (
-              <View key={section.id} style={styles.routeStep}>
-                <View style={styles.routeStepCircle}>
-                  <Text style={styles.routeStepText}>{idx + 1}</Text>
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.sectionTitle}>{section.label}</Text>
-                  <Text style={styles.metaMuted}>{sectionItems.join(', ')}</Text>
-                </View>
-                <Badge label={`Gang ${section.aisle}`} tone="accent" />
-              </View>
-            );
-          })}
-        </View>
-      )}
-
-      {!testMode && mapMode !== 'house' && (
-        <View style={styles.navCtaRow}>
-          <View>
-            <Text style={styles.sectionTitle}>Zeit sparen im Markt</Text>
-            <Text style={styles.metaMuted}>Aisle-Hints sind Free. Turn-by-Turn im Pro/Familienplan.</Text>
+      <View style={styles.navInfoCard}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <Ionicons name="map-outline" size={18} color={colors.accent} />
+          <View style={{ gap: 2 }}>
+            <Text style={[styles.sectionTitle, { fontSize: 16 }]}>Navigation</Text>
+            <Text style={styles.metaMuted}>
+              {isHouse ? 'House plan' : 'Pilot store'} • {pdrActive ? 'PDR on' : 'PDR off'}
+            </Text>
           </View>
-          <Pressable style={styles.primaryButton}>
-            <Ionicons name="navigate" size={18} color="#fff" />
-            <Text style={styles.primaryButtonText}>Route starten</Text>
-          </Pressable>
         </View>
-      )}
+        <View style={styles.segment}>
+          {(['route', 'positioning', 'setup'] as const).map((id) => (
+            <Pressable
+              key={id}
+              style={[styles.segmentButton, panel === id && styles.segmentButtonActive]}
+              onPress={() => setPanel(id)}
+            >
+              <Text style={[styles.metaText, panel === id && { color: colors.ink }]}>
+                {id === 'route' ? 'Route' : id === 'positioning' ? 'Position' : 'Setup'}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      </View>
+
+      {panel === 'positioning' ? (
+      <View style={styles.glassCard}>
+        <View style={styles.listControlRow}>
+          <Text style={styles.sectionTitle}>Positioning</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            {Platform.OS === 'ios' ? <Badge label="iOS: PDR-only" tone="muted" /> : null}
+            <Badge label={`PDR ${positioning.pdrConfidence}`} tone="accent" />
+            {navOn && destinationId ? (
+              <Badge label={nav.offRoute ? 'Off-route' : 'On-route'} tone={nav.offRoute ? 'accent' : 'success'} />
+            ) : null}
+          </View>
+        </View>
+
+        {isHouse ? (
+          <Text style={styles.metaMuted}>Set start: switch to 2D, set Tool=Start, then tap the plan.</Text>
+        ) : (
+          <>
+            <Text style={styles.metaMuted}>Start node</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
+              {allNodes.map((n) => {
+                const active = n.id === startNodeId;
+                return (
+                  <Pressable key={n.id} style={[styles.pin, active && styles.pinActive]} onPress={() => onSelectStart(n.id)}>
+                    <Text style={styles.pinText}>
+                      {active ? '⭐' : n.type === 'entry' ? '🟢' : n.type === 'exit' ? '🏁' : n.sectionId ? '🛒' : '📍'}
+                    </Text>
+                    <Text style={styles.pinLabel}>{n.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          </>
+        )}
+
+        <View style={styles.pdrRow}>
+          <Pressable style={[styles.primaryButton, { paddingVertical: 8 }]} onPress={togglePdr}>
+            <Text style={styles.primaryButtonText}>{pdrActive ? 'Stop PDR' : 'Start PDR'}</Text>
+          </Pressable>
+          <Pressable style={styles.ghostButton} onPress={onRecenter}>
+            <Ionicons name="refresh" size={16} color={colors.accent} />
+            <Text style={styles.metaText}>Recenter</Text>
+          </Pressable>
+          {onResetHeading ? (
+            <Pressable style={styles.ghostButton} onPress={onResetHeading}>
+              <Ionicons name="compass" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Align</Text>
+            </Pressable>
+          ) : null}
+        </View>
+
+        <View style={styles.pdrRow}>
+          {onAdjustStrideScale ? (
+            <>
+              <Pressable style={styles.ghostButton} onPress={() => onAdjustStrideScale(-0.05)}>
+                <Ionicons name="remove" size={16} color={colors.accent} />
+                <Text style={styles.metaText}>Stride</Text>
+              </Pressable>
+              <Badge label={`x${(strideScale ?? 1).toFixed(2)}`} tone="accent" />
+              <Pressable style={styles.ghostButton} onPress={() => onAdjustStrideScale(0.05)}>
+                <Ionicons name="add" size={16} color={colors.accent} />
+                <Text style={styles.metaText}>Stride</Text>
+              </Pressable>
+            </>
+          ) : null}
+
+          {onToggleWifiCorrections && Platform.OS !== 'ios' ? (
+            <View style={styles.inlineSwitch}>
+              <Text style={styles.metaText}>Wi‑Fi corr</Text>
+              <Switch value={!!wifiCorrections} onValueChange={onToggleWifiCorrections} />
+            </View>
+          ) : null}
+          {onScanWifi ? (
+            <Pressable style={styles.ghostButton} onPress={onScanWifi}>
+              <Ionicons name="wifi" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Scan</Text>
+            </Pressable>
+          ) : null}
+        </View>
+
+        <View style={styles.pdrRow}>
+          <Badge label={`Steps ${positioning.steps}`} tone="accent" />
+          <Badge label={`Heading ${(currentPose?.headingDeg ?? 0).toFixed(0)}°`} />
+          <Badge label={`Snap ${currentPose?.snapped ? 'on' : 'off'}`} tone={currentPose?.snapped ? 'success' : 'muted'} />
+          <Badge label={`Src ${currentPose?.source ?? '—'}`} />
+          <Badge label={`Wi‑Fi ${positioning.wifi.status}`} />
+        </View>
+
+        {positioning.wifi.note ? <Text style={styles.metaMuted}>Wi‑Fi: {positioning.wifi.note}</Text> : null}
+      </View>
+      ) : null}
+
+      {panel === 'route' ? (isHouse ? (
+        <View style={styles.glassCard}>
+          <View style={styles.listControlRow}>
+            <Text style={styles.sectionTitle}>Route</Text>
+            {nav.route ? <Badge label={`${Math.round(nav.route.lengthMeters)} m`} tone="accent" /> : null}
+          </View>
+
+          <Text style={styles.metaMuted}>Destination</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
+            {poiNodes.map((n) => {
+              const active = destinationId === n.id;
+              return (
+                <Pressable
+                  key={n.id}
+                  style={[styles.pin, active && styles.pinActive]}
+                  onPress={() => setDestinationId(n.id)}
+                >
+                  <Text style={styles.pinText}>{active ? '★' : '📍'}</Text>
+                  <Text style={styles.pinLabel}>{n.label}</Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+
+          <View style={styles.pdrRow}>
+            <Pressable
+              style={[styles.primaryButton, { paddingVertical: 8 }]}
+              onPress={() => setNavOn((v) => !v)}
+              disabled={!destinationId}
+            >
+              <Ionicons name="navigate" size={18} color={colors.text} />
+              <Text style={styles.primaryButtonText}>{navOn ? 'Stop navigation' : 'Start navigation'}</Text>
+            </Pressable>
+            <Pressable style={styles.ghostButton} onPress={() => nav.recalc()} disabled={!destinationId}>
+              <Ionicons name="refresh" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Reroute</Text>
+            </Pressable>
+            <Pressable
+              style={styles.ghostButton}
+              onPress={() => {
+                setDestinationId(null);
+                setNavOn(false);
+              }}
+              disabled={!destinationId}
+            >
+              <Ionicons name="close" size={16} color={colors.muted} />
+              <Text style={styles.metaText}>Clear</Text>
+            </Pressable>
+          </View>
+
+          <Text style={styles.sectionSubtitle}>
+            {navOn
+              ? nav.nextInstruction
+              : destinationId
+              ? 'Route preview shown. Tap “Start navigation” for turn-by-turn.'
+              : 'Pick a destination to preview a route.'}
+          </Text>
+
+          {nav.route ? (
+            <View style={styles.routeSteps}>
+              {nav.route.maneuvers.slice(0, 8).map((m) => (
+                <View key={`${m.type}-${m.atIndex}`} style={styles.routeStep}>
+                  <View style={styles.routeStepCircle}>
+                    <Text style={styles.routeStepText}>
+                      {m.type === 'left'
+                        ? 'L'
+                        : m.type === 'right'
+                        ? 'R'
+                        : m.type === 'uturn'
+                        ? 'U'
+                        : m.type === 'arrive'
+                        ? '✓'
+                        : '•'}
+                    </Text>
+                  </View>
+                  <Text style={styles.metaText}>
+                    {m.instruction} • {Math.round(m.distanceFromStartMeters)}m
+                  </Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
+        </View>
+      ) : (
+        <View style={styles.glassCard}>
+          <View style={styles.listControlRow}>
+            <Text style={styles.sectionTitle}>Pilot</Text>
+            <Badge label={`${pendingCount} pending`} tone="muted" />
+          </View>
+          <View style={styles.pdrRow}>
+            <Pressable style={styles.primaryButton} onPress={optimiseRoute}>
+              <Ionicons name="navigate" size={18} color={colors.text} />
+              <Text style={styles.primaryButtonText}>Optimize route</Text>
+            </Pressable>
+            <Pressable style={styles.ghostButton} onPress={clearNodes}>
+              <Ionicons name="trash-outline" size={18} color={colors.muted} />
+              <Text style={styles.metaText}>Clear custom</Text>
+            </Pressable>
+          </View>
+          <Text style={styles.metaMuted}>Route order: {routeOrder.join(' → ')}</Text>
+        </View>
+      )) : null}
+
+      {panel === 'setup' ? (isHouse ? (
+        <View style={styles.glassCard}>
+          <View style={styles.listControlRow}>
+            <Text style={styles.sectionTitle}>Setup</Text>
+            <View style={styles.segment}>
+              {(['house', 'pilot'] as const).map((m) => (
+                <Pressable
+                  key={m}
+                  style={[styles.segmentButton, mapMode === m && styles.segmentButtonActive]}
+                  onPress={() => onChangeMapMode(m)}
+                >
+                  <Text style={[styles.metaText, mapMode === m && { color: colors.ink }]}>
+                    {m === 'house' ? 'House' : 'Pilot'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+
+          <View style={styles.listControlRow}>
+            <Text style={styles.sectionTitle}>Tap mode</Text>
+            <View style={styles.segment}>
+              {(['start', 'measure', 'anchor'] as const).map((t) => (
+                <Pressable
+                  key={t}
+                  style={[styles.segmentButton, planTool === t && styles.segmentButtonActive]}
+                  onPress={() => setPlanTool(t)}
+                >
+                  <Text style={[styles.metaText, planTool === t && { color: colors.ink }]}>
+                    {t === 'start' ? 'Start' : t === 'measure' ? 'Measure' : 'Anchor'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {planTool === 'measure' ? (
+              <Pressable
+                style={styles.ghostButton}
+                onPress={() => {
+                  setPlanMeasureA(null);
+                  setPlanMeasureB(null);
+                }}
+              >
+                <Ionicons name="trash-outline" size={16} color={colors.muted} />
+                <Text style={styles.metaText}>Clear</Text>
+              </Pressable>
+            ) : null}
+          </View>
+
+          <Text style={styles.metaMuted}>
+            {planTool === 'start'
+              ? 'Tap on the 2D map to set your start position.'
+              : planTool === 'measure'
+              ? 'Tap A then B on the 2D map to measure distance.'
+              : 'Tap on the 2D map to place/update a Wi‑Fi anchor.'}
+          </Text>
+
+          <View style={styles.planControls}>
+            <Text style={styles.metaText}>Scale (px/m)</Text>
+            <TextInput
+              style={[styles.searchInput, styles.floorInputSmall]}
+              placeholder="px / m"
+              keyboardType="numeric"
+              value={String(Math.round(planImagePixelsPerMeter))}
+              onChangeText={(v) => setPlanImagePixelsPerMeter(Number(v) || 1)}
+            />
+            <Pressable
+              style={styles.ghostButton}
+              onPress={() => {
+                setPlanCalA(null);
+                setPlanCalB(null);
+                setPlanCalMeters('');
+                if (planDefaultImagePixelsPerMeter) setPlanImagePixelsPerMeter(planDefaultImagePixelsPerMeter);
+              }}
+            >
+              <Ionicons name="refresh" size={16} color={colors.accent} />
+              <Text style={styles.metaText}>Reset scale</Text>
+            </Pressable>
+          </View>
+
+          {planTool === 'measure' && (planMeasureA || planMeasureB) ? (
+            <View style={styles.planControls}>
+              <Badge label={`A ${planMeasureA ? `${Math.round(planMeasureA.x)},${Math.round(planMeasureA.y)}` : '—'}`} />
+              <Badge label={`B ${planMeasureB ? `${Math.round(planMeasureB.x)},${Math.round(planMeasureB.y)}` : '—'}`} />
+              {planMeasureA && planMeasureB ? (
+                <Badge
+                  label={`Δ ${(Math.hypot(planMeasureB.x - planMeasureA.x, planMeasureB.y - planMeasureA.y) / Math.max(0.0001, planImagePixelsPerMeter)).toFixed(2)} m`}
+                  tone="accent"
+                />
+              ) : (
+                <Text style={styles.metaMuted}>Tap point {planMeasureA ? 'B' : 'A'}</Text>
+              )}
+            </View>
+          ) : null}
+
+          <Text style={styles.metaMuted}>Tip: Use “Measure” and enter known distance to fine-tune px/m.</Text>
+        </View>
+      ) : (
+        <View style={styles.glassCard}>
+          <View style={styles.listControlRow}>
+            <Text style={styles.sectionTitle}>Setup</Text>
+            <View style={styles.segment}>
+              {(['house', 'pilot'] as const).map((m) => (
+                <Pressable
+                  key={m}
+                  style={[styles.segmentButton, mapMode === m && styles.segmentButtonActive]}
+                  onPress={() => onChangeMapMode(m)}
+                >
+                  <Text style={[styles.metaText, mapMode === m && { color: colors.ink }]}>
+                    {m === 'house' ? 'House' : 'Pilot'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+          <Text style={styles.metaMuted}>Switch to House to use the 2D/3D floorplan maps.</Text>
+        </View>
+      )) : null}
     </Section>
   );
 };
@@ -1740,25 +1745,21 @@ export default function App() {
   const [recent, setRecent] = useState<string[]>(['Milch', 'Brot', 'Eier']);
   const [activity, setActivity] = useState<string[]>(['Willkommen in deiner Liste.']);
   const [pdrActive, setPdrActive] = useState(false);
-  const [navMapMode, setNavMapMode] = useState<'pilot' | 'house'>('pilot');
-  const [planId, setPlanId] = useState<PlanId>('house');
+  const togglePdr = React.useCallback(() => setPdrActive((v) => !v), []);
+  const [navMapMode, setNavMapMode] = useState<'pilot' | 'house'>('house');
+  const planId: PlanId = 'neue';
   const activePlan = useMemo(() => planConfigs[planId], [planId]);
   const [planTool, setPlanTool] = useState<PlanTool>('start');
   const [planMeasureA, setPlanMeasureA] = useState<{ x: number; y: number } | null>(null);
   const [planMeasureB, setPlanMeasureB] = useState<{ x: number; y: number } | null>(null);
   const [planAnchorsById, setPlanAnchorsById] = useState<Record<PlanId, StoreMapAnchor[]>>(() => ({
-    house: [
-      { bssid: '8c:19:b5:d8:b1:6d', label: 'Home Wi‑Fi', x: 1, y: 1, floor: 0, source: 'live', confidence: 0.9 },
-    ],
-    neue: [
-      { bssid: '8c:19:b5:d8:b1:6d', label: 'Home Wi‑Fi', x: 1, y: 1, floor: 0, source: 'live', confidence: 0.9 },
-    ],
+    neue: [{ bssid: '8c:19:b5:d8:b1:6d', label: 'Home Wi‑Fi', x: 1, y: 1, floor: 0, source: 'live', confidence: 0.9 }],
   }));
   const activeStoreMap: StoreMap = useMemo(() => {
     if (navMapMode !== 'house') return defaultStoreMap;
-    const anchors = planAnchorsById[planId] ?? [];
+    const anchors = planAnchorsById.neue ?? [];
     return { ...activePlan.map, anchors };
-  }, [navMapMode, activePlan, planAnchorsById, planId]);
+  }, [navMapMode, activePlan, planAnchorsById]);
   const [planImagePixelsPerMeter, setPlanImagePixelsPerMeter] = useState(
     activePlan.defaultImagePixelsPerMeter ?? 90,
   );
@@ -1766,248 +1767,55 @@ export default function App() {
   const [planCalB, setPlanCalB] = useState<{ x: number; y: number } | null>(null);
   const [planCalMeters, setPlanCalMeters] = useState('');
   const [startOverride, setStartOverride] = useState<PdrPoint | null>(null);
-  const [pdrState, setPdrState] = useState<PdrState>({
-    steps: 0,
-    heading: 0,
-    gyroHeading: 0,
-    magHeading: 0,
-    floor: 0,
-    pressure: 0,
-    status: 'idle',
-  });
-  const pdrBaseline = React.useRef<number | null>(null);
   const [startNodeId, setStartNodeId] = useState<string>('entry');
-  const [pdrPath, setPdrPath] = useState<PdrPoint[]>([]);
-  const headingRef = React.useRef(0);
-  const magHeadingRef = React.useRef(0);
-  const gyroHeadingRef = React.useRef(0);
-  const gyroIntegratedHeadingRef = React.useRef(0);
-  const lastMotionAtRef = React.useRef<number | null>(null);
-  const yawRateRef = React.useRef(0);
-  const magStrengthEmaRef = React.useRef<number | null>(null);
-  const magReliabilityRef = React.useRef(0.5);
-  const [pdrConfidence, setPdrConfidence] = useState<'good' | 'ok' | 'low'>('ok');
-  const lastStepTime = React.useRef<number>(0);
-  const stepLengthRef = React.useRef(0.6);
-  const strideScaleRef = React.useRef(1);
   const [strideScale, setStrideScale] = useState(1);
-  const [motionDebug, setMotionDebug] = useState<MotionDebug>({
-    accelMag: 0,
-    accelBaseline: 0,
-    accelDiff: 0,
-    stepThreshold: 0.12,
-    stepLength: 0.6,
-    lastStepAt: null,
-    lastIntervalMs: 0,
-    isStationary: true,
-    stepSource: 'none',
-    deviceMotionLinAccMag: 0,
-    pedometerSteps: 0,
-    deviceSteps: 0,
-  });
-  const [sensorHealth, setSensorHealth] = useState<SensorHealth>({
-    accel: { available: null, lastAt: null },
-    gyro: { available: null, lastAt: null },
-    mag: { available: null, lastAt: null },
-    baro: { available: null, lastAt: null },
-    deviceMotion: { available: null, lastAt: null },
-    pedometer: { available: null, lastAt: null },
-  });
-  const sensorHealthRef = React.useRef<SensorHealth>(sensorHealth);
-  const motionDebugRef = React.useRef<MotionDebug>(motionDebug);
-  const lastDebugUpdateRef = React.useRef(0);
-  const stationarySinceRef = React.useRef<number | null>(null);
-  const lastIntervalRef = React.useRef(0);
-  const lastPedometerStepsRef = React.useRef<number | null>(null);
-  const deviceStepsRef = React.useRef(0);
-  const stepPeakRef = React.useRef<{ inPeak: boolean; max: number }>({ inPeak: false, max: 0 });
-  const linAccWindowRef = React.useRef<number[]>([]);
-  const gravityRef = React.useRef<{ x: number; y: number; z: number; init: boolean }>({ x: 0, y: 0, z: 0, init: false });
+  const [wifiCorrections, setWifiCorrections] = useState(Platform.OS !== 'ios');
   const getStartCoord = React.useCallback((): PdrPoint => {
     if (startOverride) return startOverride;
     const all = [...activeStoreMap.nodes, ...customNodes];
     const node = all.find((n) => n.id === startNodeId) || all[0];
     return { x: node?.x ?? 0.5, y: node?.y ?? 0.5 };
   }, [startOverride, startNodeId, activeStoreMap, customNodes]);
-  const [wifiAnchor, setWifiAnchor] = useState<StoreMapAnchor | null>(null);
-  const [wifiStatus, setWifiStatus] = useState<'mock' | 'live' | 'off'>('mock');
-  const [wifiConfidence, setWifiConfidence] = useState(0.7);
-  const [wifiNote, setWifiNote] = useState<string | null>(null);
-  const [wifiLastScanAt, setWifiLastScanAt] = useState<number | null>(null);
-  const [wifiLastCount, setWifiLastCount] = useState(0);
-  const [wifiFix, setWifiFix] = useState<WifiFix | null>(null);
-  const wifiScanInFlightRef = React.useRef(false);
-  const wifiRssiEmaRef = React.useRef<Record<string, number>>({});
-  const computeWifiFix = React.useCallback(
-    (readings: WifiReading[], anchors: StoreMapAnchor[]): WifiFix | null => {
-      const byBssid = new Map<string, StoreMapAnchor>();
-      anchors.forEach((a) => byBssid.set(normalizeBssid(a.bssid), a));
-
-      const matched = readings
-        .filter((r) => r?.bssid)
-        .map((r) => ({ ...r, bssid: normalizeBssid(r.bssid) }))
-        .filter((r) => byBssid.has(r.bssid));
-
-      if (!matched.length) return null;
-
-      const best = matched.reduce((acc, r) => (r.level > acc.level ? r : acc), matched[0]);
-
-      const smoothed: { bssid: string; level: number }[] = matched.map((r) => {
-        const prev = wifiRssiEmaRef.current[r.bssid];
-        const next = prev === undefined ? r.level : prev * 0.65 + r.level * 0.35;
-        wifiRssiEmaRef.current[r.bssid] = next;
-        return { bssid: r.bssid, level: next };
-      });
-
-      let sumW = 0;
-      let x = 0;
-      let y = 0;
-      for (const r of smoothed) {
-        const a = byBssid.get(r.bssid);
-        if (!a) continue;
-        const w = clamp(Math.exp((clamp(r.level, -95, -35) + 100) / 10), 1, 400);
-        sumW += w;
-        x += a.x * w;
-        y += a.y * w;
-      }
-      if (sumW <= 0) return null;
-      return { x: x / sumW, y: y / sumW, matched: matched.length, best };
+  const indoorPos = useIndoorPositioning({
+    enabled: pdrActive,
+    map: activeStoreMap,
+    start: getStartCoord(),
+    strideScale,
+    wifiEnabled: wifiCorrections,
+    wifiScanIntervalMs: 3200,
+    snap: {
+      maxSnapMeters: navMapMode === 'house' ? 1.7 : 1.2,
+      hardClamp: navMapMode === 'house',
+      switchPenaltyMeters: navMapMode === 'house' ? 1.25 : 0.35,
     },
-    [],
-  );
-
-  const applyWifiCorrection = React.useCallback(
-    (fix: PdrPoint, conf: number) => {
-      setPdrPath((prev) => {
-        const current = prev[prev.length - 1] || fix;
-        const dist = Math.hypot(current.x - fix.x, current.y - fix.y);
-        const moving = !motionDebugRef.current.isStationary;
-        const blend = clamp(conf * (moving ? 0.35 : 0.75), 0.08, 0.7);
-
-        // If we're extremely far away but Wi‑Fi is strong, hard reset (helps after drift).
-        if (dist > 10 && conf > 0.75) return [fix];
-
-        // If Wi‑Fi is weak and far, ignore to prevent snapping to wrong AP.
-        if (dist > 6 && conf < 0.45) return prev;
-
-        const blended = { x: current.x * (1 - blend) + fix.x * blend, y: current.y * (1 - blend) + fix.y * blend };
-        return [...prev, blended].slice(-200);
-      });
-    },
-    [],
-  );
-
-  const scanWifiOnce = React.useCallback(async () => {
-    if (Platform.OS === 'web') {
-      setWifiStatus('off');
-      setWifiAnchor(null);
-      setWifiConfidence(0);
-      setWifiNote('Wi‑Fi scan not available on web.');
-      setWifiLastScanAt(Date.now());
-      setWifiLastCount(0);
-      setWifiFix(null);
-      return;
-    }
-    if (wifiScanInFlightRef.current) return;
-    wifiScanInFlightRef.current = true;
-
-    const now = Date.now();
-    try {
-      const res = await scanWifi();
-      setWifiLastScanAt(now);
-      setWifiLastCount(res.readings.length);
-      setWifiNote(res.status === 'ok' ? null : res.message ?? 'Wi‑Fi scan failed.');
-
-      const readings = res.readings.filter((r) => r?.bssid);
-      const anchors = activeStoreMap.anchors ?? [];
-      if (!readings.length || anchors.length === 0) {
-        setWifiStatus('off');
-        setWifiAnchor(null);
-        setWifiConfidence(0);
-        setWifiFix(null);
-        return;
-      }
-
-      const fix = computeWifiFix(readings, anchors);
-      if (!fix) {
-        setWifiStatus('off');
-        setWifiAnchor(null);
-        setWifiConfidence(0.15);
-        setWifiFix(null);
-        return;
-      }
-
-      const bestBssid = fix.best?.bssid ? normalizeBssid(fix.best.bssid) : '';
-      const bestAnchor = anchors.find((a) => normalizeBssid(a.bssid) === bestBssid) ?? null;
-
-      const bestLevel = fix.best?.level ?? -90;
-      const base = clamp((bestLevel + 100) / 55, 0.15, 0.95);
-      const multiBoost = clamp(0.08 * (fix.matched - 1), 0, 0.2);
-      const conf = clamp(base + multiBoost, 0.15, 0.98);
-
-      setWifiFix(fix);
-      setWifiAnchor(bestAnchor ?? { bssid: bestBssid, label: `Wi‑Fi (${fix.matched})`, x: fix.x, y: fix.y, floor: 0, source: 'live', confidence: conf });
-      setWifiStatus('live');
-      setWifiConfidence(conf);
-      if (pdrActive) applyWifiCorrection({ x: fix.x, y: fix.y }, conf);
-    } finally {
-      wifiScanInFlightRef.current = false;
-    }
-  }, [activeStoreMap, applyWifiCorrection, computeWifiFix, pdrActive]);
-
-  const useBestWifiAsAnchor = React.useCallback(() => {
-    if (navMapMode !== 'house') return;
-    const best = wifiFix?.best;
-    if (!best?.bssid) return;
-    const current = pdrPath[pdrPath.length - 1] || getStartCoord();
-    setPlanAnchorsById((prev) => {
-      const existing = prev[planId] ?? [];
-      const base =
-        existing[0] ??
-        ({
-          bssid: best.bssid,
-          label: 'Wi‑Fi Anchor',
-          x: current.x,
-          y: current.y,
-          floor: 0,
-          source: 'live',
-          confidence: 0.9,
-        } as StoreMapAnchor);
-      const updated0: StoreMapAnchor = {
-        ...base,
-        bssid: best.bssid,
-        label: base.label?.startsWith('Wi‑Fi') ? base.label : `Wi‑Fi Anchor`,
-        x: current.x,
-        y: current.y,
-        floor: 0,
-        source: 'live',
-        confidence: clamp(base.confidence ?? 0.85, 0.5, 0.98),
-      };
-      return { ...prev, [planId]: [updated0, ...existing.slice(1)] };
-    });
-  }, [getStartCoord, navMapMode, pdrPath, planId, wifiFix?.best]);
+  });
 
   const adjustStrideScale = React.useCallback((delta: number) => {
     setStrideScale((prev) => {
       const next = clamp(Math.round((prev + delta) * 100) / 100, 0.6, 1.5);
-      strideScaleRef.current = next;
       return next;
     });
   }, []);
 
+  const alignHeadingToMag = indoorPos.actions.alignHeadingToMag;
+  const resetTo = indoorPos.actions.resetTo;
+  const scanWifiNow = indoorPos.actions.scanWifiNow;
+
   const resetHeadingToMag = React.useCallback(() => {
-    const mag = magHeadingRef.current;
-    headingRef.current = mag;
-    gyroIntegratedHeadingRef.current = mag;
-    gyroHeadingRef.current = mag;
-    setPdrState((s) => ({ ...s, heading: mag, gyroHeading: mag, magHeading: magHeadingRef.current }));
-  }, []);
+    alignHeadingToMag();
+  }, [alignHeadingToMag]);
   const recenterPdr = React.useCallback(() => {
-    const all = [...activeStoreMap.nodes, ...customNodes];
-    const node = all.find((n) => n.id === startNodeId) || all[0];
-    setPdrPath([{ x: node?.x ?? 0.5, y: node?.y ?? 0.5 }]);
-    setPdrState((s) => ({ ...s, steps: 0 }));
-  }, [activeStoreMap, customNodes, startNodeId]);
+    resetTo(getStartCoord());
+  }, [getStartCoord, resetTo]);
+
+  const scanWifiOnce = React.useCallback(async () => {
+    await scanWifiNow();
+  }, [scanWifiNow]);
+
+  React.useEffect(() => {
+    if (!pdrActive) return;
+    resetTo(getStartCoord());
+  }, [activeStoreMap.id, getStartCoord, pdrActive, resetTo]);
 
   const pickRecipeFromPrompt = (prompt: string) => {
     const words = prompt
@@ -2185,412 +1993,8 @@ export default function App() {
   const offlineCopy = { title: t.offlineTitle, message: t.offlineMessage };
 
   React.useEffect(() => {
-    let devMotionSub: any;
-    let magSub: any;
-    let baroSub: any;
-    let pedometerSub: any;
-    const start = async () => {
-      if (!pdrActive) return;
-	      setPdrState((s) => ({ ...s, status: 'tracking', steps: 0, heading: 0, gyroHeading: 0, magHeading: 0 }));
-	      setPdrPath([getStartCoord()]);
-	      headingRef.current = 0;
-	      gyroHeadingRef.current = 0;
-	      gyroIntegratedHeadingRef.current = 0;
-	      magHeadingRef.current = 0;
-	      lastMotionAtRef.current = null;
-	      yawRateRef.current = 0;
-	      magStrengthEmaRef.current = null;
-	      magReliabilityRef.current = 0.5;
-	      lastStepTime.current = 0;
-      lastIntervalRef.current = 0;
-      stationarySinceRef.current = null;
-      lastDebugUpdateRef.current = 0;
-      lastPedometerStepsRef.current = null;
-      deviceStepsRef.current = 0;
-      stepPeakRef.current = { inPeak: false, max: 0 };
-      linAccWindowRef.current = [];
-      gravityRef.current = { x: 0, y: 0, z: 0, init: false };
-      sensorHealthRef.current = {
-        accel: { available: null, lastAt: null },
-        gyro: { available: null, lastAt: null },
-        mag: { available: null, lastAt: null },
-        baro: { available: null, lastAt: null },
-        deviceMotion: { available: null, lastAt: null },
-        pedometer: { available: null, lastAt: null },
-      };
-      setSensorHealth(sensorHealthRef.current);
-	      const initialDebug: MotionDebug = {
-        accelMag: 0,
-        accelBaseline: 0,
-        accelDiff: 0,
-	        stepThreshold: 0.12,
-	        stepLength: 0.6 * strideScaleRef.current,
-        lastStepAt: null,
-        lastIntervalMs: 0,
-        isStationary: true,
-        stepSource: 'none',
-        deviceMotionLinAccMag: 0,
-        pedometerSteps: 0,
-        deviceSteps: 0,
-      };
-      motionDebugRef.current = initialDebug;
-      setMotionDebug(initialDebug);
-
-      const updateSensorHealth = (patch: Partial<SensorHealth>) => {
-        sensorHealthRef.current = { ...sensorHealthRef.current, ...patch };
-        setSensorHealth(sensorHealthRef.current);
-      };
-
-      const [devOk, magOk, baroOk, pedOk] = await Promise.all([
-        DeviceMotion.isAvailableAsync().catch(() => false),
-        Magnetometer.isAvailableAsync().catch(() => false),
-        Barometer.isAvailableAsync().catch(() => false),
-        Pedometer.isAvailableAsync().catch(() => false),
-      ]);
-      updateSensorHealth({
-        accel: { ...sensorHealthRef.current.accel, available: null },
-        gyro: { ...sensorHealthRef.current.gyro, available: null },
-        mag: { ...sensorHealthRef.current.mag, available: magOk },
-        baro: { ...sensorHealthRef.current.baro, available: baroOk },
-        deviceMotion: { ...sensorHealthRef.current.deviceMotion, available: devOk },
-        pedometer: { ...sensorHealthRef.current.pedometer, available: pedOk },
-      });
-
-	      // Magnetometer: heavily smoothed, only used as a slow corrector
-	      if (magOk) {
-	        try {
-	          Magnetometer.setUpdateInterval(200);
-	          magSub = Magnetometer.addListener(({ x, y, z }) => {
-	            sensorHealthRef.current = {
-	              ...sensorHealthRef.current,
-	              mag: { ...sensorHealthRef.current.mag, lastAt: Date.now() },
-	            };
-	            const strength = Math.hypot(x ?? 0, y ?? 0, z ?? 0);
-	            const emaPrev = magStrengthEmaRef.current ?? strength;
-	            const ema = emaPrev * 0.92 + strength * 0.08;
-	            magStrengthEmaRef.current = ema;
-
-	            const dev = Math.abs(strength - ema);
-	            const inRange = ema > 15 && ema < 80; // µT typical range
-	            const stable = dev < 10;
-	            const relInstant = clamp((inRange ? 1 : 0.25) * (stable ? 1 : 0.5) * (1 - clamp(dev / 25, 0, 1)), 0, 1);
-	            magReliabilityRef.current = clamp(magReliabilityRef.current * 0.85 + relInstant * 0.15, 0, 1);
-
-	            const angle = Math.atan2(y ?? 0, x ?? 0) * (180 / Math.PI);
-	            const heading = wrapHeading(angle);
-	            const diff = headingDiff(heading, magHeadingRef.current);
-	            const factor = 0.03 + 0.09 * magReliabilityRef.current;
-	            magHeadingRef.current = wrapHeading(magHeadingRef.current + diff * factor);
-	          });
-	        } catch (e: any) {
-	          updateSensorHealth({
-	            mag: {
-	              ...sensorHealthRef.current.mag,
-              available: false,
-              error: String(e?.message || e),
-            },
-          });
-        }
-      }
-
-      const toDeg = (v: number) => (Math.abs(v) <= Math.PI * 2 + 0.5 ? (v * 180) / Math.PI : v);
-
-		      const applyStep = (source: MotionDebug['stepSource'], stepsDelta: number, now: number) => {
-		        if (stepsDelta <= 0) return;
-		        const stepLen = stepLengthRef.current * strideScaleRef.current;
-		        const hRad = (headingRef.current * Math.PI) / 180;
-		        const clampMax = activeStoreMap.gridSize;
-		        setPdrPath((prev) => {
-		          const coords: PdrPoint[] = [...prev];
-		          let cur = coords[coords.length - 1] || getStartCoord();
-		          for (let i = 0; i < Math.min(stepsDelta, 20); i += 1) {
-		            let nx = cur.x + Math.sin(hRad) * stepLen;
-		            let ny = cur.y - Math.cos(hRad) * stepLen;
-		            nx = Math.max(0, Math.min(clampMax, nx));
-		            ny = Math.max(0, Math.min(clampMax, ny));
-		            cur = { x: nx, y: ny };
-		            coords.push(cur);
-		          }
-		          return coords.slice(-200);
-		        });
-	        setPdrState((s) => ({ ...s, steps: s.steps + stepsDelta }));
-	        const nextDebug = { ...motionDebugRef.current, stepSource: source, lastStepAt: now };
-        motionDebugRef.current = nextDebug;
-        setMotionDebug(nextDebug);
-      };
-
-      // DeviceMotion: primary for step detection and heading stability
-      if (devOk) {
-        try {
-          DeviceMotion.setUpdateInterval(50);
-          devMotionSub = DeviceMotion.addListener((m) => {
-            const now = Date.now();
-            sensorHealthRef.current = {
-              ...sensorHealthRef.current,
-              deviceMotion: { ...sensorHealthRef.current.deviceMotion, lastAt: now },
-	            };
-	
-	            const prevTs = lastMotionAtRef.current ?? now;
-	            const dt = clamp((now - prevTs) / 1000, 0.001, 0.2);
-	            lastMotionAtRef.current = now;
-
-	            const rot = m.rotation;
-	            const attitudeYaw =
-	              rot && typeof rot.alpha === 'number' ? wrapHeading(toDeg(rot.alpha)) : null;
-	            if (attitudeYaw !== null) {
-	              gyroHeadingRef.current = attitudeYaw;
-	              const d = headingDiff(attitudeYaw, gyroIntegratedHeadingRef.current);
-	              gyroIntegratedHeadingRef.current = wrapHeading(gyroIntegratedHeadingRef.current + clamp(d, -20, 20));
-	            }
-
-	            const rr = (m as any).rotationRate as { alpha?: number; beta?: number; gamma?: number } | undefined;
-	            if (rr && typeof rr.alpha === 'number') {
-	              const yawRate = clamp(toDeg(rr.alpha), -720, 720);
-	              yawRateRef.current = yawRate;
-	              gyroIntegratedHeadingRef.current = wrapHeading(gyroIntegratedHeadingRef.current + yawRate * dt);
-	            } else {
-	              yawRateRef.current = 0;
-	            }
-
-	            const mag = magHeadingRef.current;
-	            const magReliability = magReliabilityRef.current;
-	            const turningFast = Math.abs(yawRateRef.current) > 140;
-	            const gain = (0.008 + 0.05 * magReliability) * (turningFast ? 0.2 : 1);
-	            const err = headingDiff(mag, gyroIntegratedHeadingRef.current);
-	            gyroIntegratedHeadingRef.current = wrapHeading(gyroIntegratedHeadingRef.current + err * gain);
-	            headingRef.current = gyroIntegratedHeadingRef.current;
-
-	            setPdrState((s) => ({
-	              ...s,
-	              heading: headingRef.current,
-	              gyroHeading: gyroIntegratedHeadingRef.current,
-	              magHeading: magHeadingRef.current,
-	            }));
-
-            // Prefer native linear acceleration, fallback to high-pass filter on accelIncludingGravity.
-            const lin = m.acceleration;
-            const incl = m.accelerationIncludingGravity;
-            let ax = 0;
-            let ay = 0;
-            let az = 0;
-            if (lin) {
-              ax = lin.x;
-              ay = lin.y;
-              az = lin.z;
-            } else if (incl) {
-              const g = gravityRef.current;
-              if (!g.init) {
-                gravityRef.current = { x: incl.x, y: incl.y, z: incl.z, init: true };
-              } else {
-                const a = 0.92;
-                gravityRef.current = {
-                  x: g.x * a + incl.x * (1 - a),
-                  y: g.y * a + incl.y * (1 - a),
-                  z: g.z * a + incl.z * (1 - a),
-                  init: true,
-                };
-              }
-              const gg = gravityRef.current;
-              ax = incl.x - gg.x;
-              ay = incl.y - gg.y;
-              az = incl.z - gg.z;
-            }
-            const linMag = Math.hypot(ax, ay, az);
-            linAccWindowRef.current.push(linMag);
-            if (linAccWindowRef.current.length > 35) linAccWindowRef.current.shift();
-            const w = linAccWindowRef.current;
-            const mean = w.reduce((a, b) => a + b, 0) / (w.length || 1);
-            const variance =
-              w.reduce((acc, v) => acc + (v - mean) * (v - mean), 0) / Math.max(1, w.length - 1);
-            const std = Math.sqrt(variance);
-            const threshold = Math.max(0.35, mean + std * 2.2);
-            const low = linMag < 0.18;
-            if (low) {
-              if (stationarySinceRef.current === null) stationarySinceRef.current = now;
-            } else {
-              stationarySinceRef.current = null;
-            }
-            const isStationary = stationarySinceRef.current !== null && now - stationarySinceRef.current > 600;
-
-            // simple peak detector
-            const peak = stepPeakRef.current;
-            if (!peak.inPeak) {
-              if (linMag > threshold) {
-                peak.inPeak = true;
-                peak.max = linMag;
-              }
-            } else {
-              peak.max = Math.max(peak.max, linMag);
-              if (linMag < mean) {
-                peak.inPeak = false;
-                const minInterval = 280;
-                if (now - lastStepTime.current > minInterval && peak.max > threshold && !isStationary) {
-                  lastIntervalRef.current = lastStepTime.current ? now - lastStepTime.current : 0;
-                  lastStepTime.current = now;
-                  const stepLen = Math.max(0.45, Math.min(1.05, 0.62 + (peak.max - threshold) * 0.18));
-                  stepLengthRef.current = stepLen;
-                  deviceStepsRef.current += 1;
-                  applyStep('deviceMotion', 1, now);
-                }
-              }
-            }
-
-	            const nextDebug: MotionDebug = {
-	              ...motionDebugRef.current,
-	              accelMag: linMag,
-	              accelBaseline: mean,
-	              accelDiff: Math.max(0, linMag - mean),
-	              stepThreshold: threshold,
-	              stepLength: stepLengthRef.current * strideScaleRef.current,
-	              lastIntervalMs: lastIntervalRef.current,
-	              isStationary,
-	              deviceMotionLinAccMag: linMag,
-	              pedometerSteps: motionDebugRef.current.pedometerSteps,
-	              deviceSteps: deviceStepsRef.current,
-	            };
-
-	            // Lightweight quality signal to surface in UI (Android magnetometers can be noisy indoors).
-	            const stepRecent = nextDebug.lastStepAt ? now - nextDebug.lastStepAt < 1800 : false;
-	            let pdrScore = 0.35;
-	            if (stepRecent) pdrScore += 0.25;
-	            if (!isStationary) pdrScore += 0.1;
-	            const magReliability2 = magReliabilityRef.current;
-	            pdrScore += (magReliability2 - 0.5) * 0.35;
-	            if (Math.abs(yawRateRef.current) > 280) pdrScore -= 0.08;
-	            const nextPdrConf: 'good' | 'ok' | 'low' = pdrScore > 0.72 ? 'good' : pdrScore > 0.45 ? 'ok' : 'low';
-
-	            motionDebugRef.current = nextDebug;
-	            if (now - lastDebugUpdateRef.current > 150) {
-	              lastDebugUpdateRef.current = now;
-	              setMotionDebug(nextDebug);
-	              setSensorHealth(sensorHealthRef.current);
-	              setPdrConfidence(nextPdrConf);
-	            }
-	          });
-	        } catch (e: any) {
-	          updateSensorHealth({
-            deviceMotion: {
-              ...sensorHealthRef.current.deviceMotion,
-              available: false,
-              error: String(e?.message || e),
-            },
-          });
-        }
-      }
-
-      // Pedometer: robust fallback for steps (especially iOS)
-      if (pedOk) {
-        try {
-          const perm = await Pedometer.getPermissionsAsync().catch(() => null);
-          if (perm && !perm.granted && perm.canAskAgain) {
-            await Pedometer.requestPermissionsAsync().catch(() => null);
-          }
-          const perm2 = await Pedometer.getPermissionsAsync().catch(() => null);
-          updateSensorHealth({
-            pedometer: {
-              ...sensorHealthRef.current.pedometer,
-              available: true,
-              permission: perm2 ? String(perm2.status) : undefined,
-            },
-          });
-	          pedometerSub = Pedometer.watchStepCount(({ steps }) => {
-	            const now = Date.now();
-            sensorHealthRef.current = {
-              ...sensorHealthRef.current,
-              pedometer: { ...sensorHealthRef.current.pedometer, lastAt: now },
-            };
-	            const prev = lastPedometerStepsRef.current;
-	            lastPedometerStepsRef.current = steps;
-	            const delta = prev === null ? 0 : steps - prev;
-	            if (delta > 0) {
-	              // Avoid double-counting when our DeviceMotion detector is already producing steps.
-	              const recentlyDeviceMotion = lastStepTime.current > 0 && now - lastStepTime.current < 1800;
-	              if (!devOk || !recentlyDeviceMotion) {
-	                lastIntervalRef.current = lastStepTime.current ? now - lastStepTime.current : 0;
-	                lastStepTime.current = now;
-	                applyStep('pedometer', delta, now);
-	              }
-	            }
-            const nextDebug = {
-              ...motionDebugRef.current,
-              pedometerSteps: steps,
-            };
-            motionDebugRef.current = nextDebug;
-            setMotionDebug(nextDebug);
-            setSensorHealth(sensorHealthRef.current);
-          });
-        } catch (e: any) {
-          updateSensorHealth({
-            pedometer: {
-              ...sensorHealthRef.current.pedometer,
-              available: false,
-              error: String(e?.message || e),
-            },
-          });
-        }
-      }
-
-      if (baroOk) {
-        try {
-          baroSub = Barometer.addListener(({ pressure }) => {
-            sensorHealthRef.current = {
-              ...sensorHealthRef.current,
-              baro: { ...sensorHealthRef.current.baro, lastAt: Date.now() },
-            };
-            if (pdrBaseline.current === null) {
-              pdrBaseline.current = pressure;
-            }
-            const delta = (pdrBaseline.current ?? pressure) - pressure;
-            const approxMeters = delta * 8.3; // rough meters per hPa
-            const floor = Math.round(approxMeters / 3);
-            setPdrState((s) => ({ ...s, pressure, floor }));
-          });
-        } catch (e: any) {
-          updateSensorHealth({
-            baro: {
-              ...sensorHealthRef.current.baro,
-              available: false,
-              error: String(e?.message || e),
-            },
-          });
-        }
-      }
-
-      if (!devOk && !magOk && !baroOk && !pedOk) {
-        setPdrState((s) => ({ ...s, status: 'denied' }));
-      }
-      setPdrConfidence(devOk ? (magOk ? 'good' : 'ok') : pedOk ? 'ok' : 'low');
-    };
-
-    const stop = () => {
-      devMotionSub?.remove?.();
-      magSub?.remove?.();
-      baroSub?.remove?.();
-      pedometerSub?.remove?.();
-    };
-
-    start();
-    return () => stop();
-  }, [pdrActive, navMapMode, activeStoreMap, getStartCoord]);
-
-  React.useEffect(() => {
-    if (!pdrActive) {
-      pdrBaseline.current = null;
-      setPdrState((s) => ({ ...s, status: 'idle' }));
-    }
-  }, [pdrActive]);
-
-  React.useEffect(() => {
-    setPdrPath([getStartCoord()]);
-  }, [getStartCoord]);
-
-  React.useEffect(() => {
-    if (!pdrActive) return;
-    const id = setInterval(() => {
-      scanWifiOnce().catch(() => {});
-    }, 2500);
-    return () => clearInterval(id);
-  }, [pdrActive, scanWifiOnce]);
+    if (Platform.OS === 'ios') setWifiCorrections(false);
+  }, []);
 
   if (!fontsLoaded) {
     return (
@@ -2702,9 +2106,9 @@ export default function App() {
               visited={customNodes.filter((n) => n.sectionId && items.some((i) => i.status === 'done' && storeSections.find((s) => s.id === n.sectionId && s.items.some((nm) => nm.toLowerCase() === i.name.toLowerCase())))).map((n) => n.id)}
               form={floorForm}
               setForm={(f) => setFloorForm((prev) => ({ ...prev, ...f }))}
-              pdrState={pdrState}
+              positioning={indoorPos.state}
               pdrActive={pdrActive}
-              togglePdr={() => setPdrActive((v) => !v)}
+              togglePdr={togglePdr}
               startNodeId={startNodeId}
               onSelectStart={(id) => {
                 setStartNodeId(id);
@@ -2716,49 +2120,24 @@ export default function App() {
                 const node = all.find((n) => n.id === id);
                 if (node) {
                   setStartOverride({ x: node.x, y: node.y });
-                  setPdrPath([{ x: node.x, y: node.y }]);
+                  indoorPos.actions.resetTo({ x: node.x, y: node.y });
                 }
               }}
-              pdrPath={pdrPath}
-              motionDebug={motionDebug}
-              sensorHealth={sensorHealth}
-              wifiAnchor={wifiAnchor}
-              wifiStatus={wifiStatus}
-              wifiConfidence={wifiConfidence}
-              wifiNote={wifiNote}
-              wifiLastScanAt={wifiLastScanAt}
-              wifiLastCount={wifiLastCount}
-              wifiFix={wifiFix}
               strideScale={strideScale}
               onAdjustStrideScale={adjustStrideScale}
               onResetHeading={resetHeadingToMag}
-              onMockAnchor={(anchor) => {
-                setWifiAnchor(anchor);
-                setWifiStatus('mock');
-                const conf = anchor.confidence ?? 0.7;
-                setWifiConfidence(conf);
-                setWifiFix({ x: anchor.x, y: anchor.y, matched: 1 });
-                if (pdrActive) {
-                  // manual anchor selection should immediately correct the position for testing
-                  setPdrPath([{ x: anchor.x, y: anchor.y }]);
-                }
+              onScanWifi={wifiCorrections && Platform.OS !== 'ios' ? scanWifiOnce : undefined}
+              wifiCorrections={wifiCorrections}
+              onToggleWifiCorrections={(enabled) => {
+                if (Platform.OS === 'ios') return;
+                setWifiCorrections(enabled);
               }}
-              onScanWifi={scanWifiOnce}
-              onUseBestWifiAsAnchor={navMapMode === 'house' ? useBestWifiAsAnchor : undefined}
-              pdrConfidence={pdrConfidence}
               onRecenter={recenterPdr}
               mapMode={navMapMode}
 	              onChangeMapMode={(m) => {
 	                setNavMapMode(m);
 	                setStartOverride(null);
-	                setPdrPath([getStartCoord()]);
-	                setWifiAnchor(null);
-	                setWifiStatus('off');
-	                setWifiConfidence(0);
-	                setWifiFix(null);
-	                setWifiNote(null);
-	                setWifiLastScanAt(null);
-	                setWifiLastCount(0);
+                  if (Platform.OS === 'ios') setWifiCorrections(false);
 	                setPlanCalA(null);
 	                setPlanCalB(null);
 	                setPlanCalMeters('');
@@ -2766,23 +2145,8 @@ export default function App() {
 	                setPlanMeasureA(null);
 	                setPlanMeasureB(null);
 	              }}
-              planId={planId}
-	              onChangePlanId={(id) => {
-	                setPlanId(id);
-	                setPlanCalA(null);
-	                setPlanCalB(null);
-	                setPlanCalMeters('');
-	                setStartOverride(null);
-	                setPdrPath([getStartCoord()]);
-	                setWifiFix(null);
-	                setWifiNote(null);
-	                const preset = planConfigs[id].defaultImagePixelsPerMeter;
-	                if (preset) setPlanImagePixelsPerMeter(preset);
-	                setPlanTool('start');
-	                setPlanMeasureA(null);
-	                setPlanMeasureB(null);
-	              }}
-              planImage={activePlan.image}
+	              planId={planId}
+	              planImage={activePlan.image}
               planImagePixelsPerMeter={planImagePixelsPerMeter}
               setPlanImagePixelsPerMeter={(n) => setPlanImagePixelsPerMeter(Math.max(1, Math.min(600, n)))}
               planDefaultImagePixelsPerMeter={activePlan.defaultImagePixelsPerMeter}
@@ -2792,59 +2156,49 @@ export default function App() {
               planMeasureB={planMeasureB}
               setPlanMeasureA={setPlanMeasureA}
               setPlanMeasureB={setPlanMeasureB}
-	              onSetAnchorAt={(pMeters) => {
-	                setPlanAnchorsById((prev) => {
-	                  const existing = prev[planId] ?? [];
-	                  const best = wifiFix?.best?.bssid;
-	                  const updated =
-	                    existing.length > 0
-	                      ? [
-	                          {
-	                            ...existing[0],
-	                            bssid: best ?? existing[0].bssid,
-	                            x: pMeters.x,
-	                            y: pMeters.y,
-	                            floor: 0,
-	                            source: 'live',
-	                          },
-	                          ...existing.slice(1),
-	                        ]
-	                      : [
-	                          {
-	                            bssid: best ?? '8c:19:b5:d8:b1:6d',
-	                            label: 'Wi‑Fi Anchor',
-	                            x: pMeters.x,
-	                            y: pMeters.y,
-	                            floor: 0,
-	                            source: 'live',
-	                            confidence: 0.9,
-	                          },
-	                        ];
-	                  return { ...prev, [planId]: updated };
-	                });
-	              }}
+		              onSetAnchorAt={(pMeters) => {
+		                setPlanAnchorsById((prev) => {
+		                  const existing = prev.neue ?? [];
+		                  const best = indoorPos.state.wifi.fix?.best?.bssid;
+		                  const updated: StoreMapAnchor[] =
+		                    existing.length > 0
+		                      ? [
+		                          {
+		                            ...existing[0],
+		                            bssid: best ?? existing[0].bssid,
+		                            x: pMeters.x,
+		                            y: pMeters.y,
+		                            floor: 0,
+		                            source: 'live' as const,
+		                          },
+		                          ...existing.slice(1),
+		                        ]
+		                      : [
+		                          {
+		                            bssid: best ?? '8c:19:b5:d8:b1:6d',
+		                            label: 'Wi‑Fi Anchor',
+		                            x: pMeters.x,
+		                            y: pMeters.y,
+		                            floor: 0,
+		                            source: 'live' as const,
+		                            confidence: 0.9,
+		                          },
+		                        ];
+		                  return { ...prev, neue: updated };
+		                });
+		              }}
               planCalA={planCalA}
               planCalB={planCalB}
               setPlanCalA={setPlanCalA}
               setPlanCalB={setPlanCalB}
-              planCalMeters={planCalMeters}
-              setPlanCalMeters={setPlanCalMeters}
-              onPlanTap={(pMeters, pPx) => {
-                if (planId === 'house') {
-                  if (!planCalA) {
-                    setPlanCalA(pPx);
-                    return;
-                  }
-                  if (!planCalB) {
-                    setPlanCalB(pPx);
-                    return;
-                  }
-                }
-                setStartOverride(pMeters);
-                setPdrPath([pMeters]);
-              }}
-            />
-          ) : null}
+	              planCalMeters={planCalMeters}
+	              setPlanCalMeters={setPlanCalMeters}
+		              onPlanTap={(pMeters, pPx) => {
+		                setStartOverride(pMeters);
+                    indoorPos.actions.resetTo(pMeters);
+		              }}
+	            />
+	          ) : null}
 
             {activeTab === 'plans' ? (
               <PlansSection
@@ -3548,13 +2902,18 @@ const styles = StyleSheet.create({
   tabIndicator: { marginTop: 6, height: 3, width: 28, borderRadius: 999, backgroundColor: colors.accent },
   planControls: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 },
   planWrap: {
-    marginTop: 10,
-    height: 420,
+    marginTop: 12,
+    height: 520,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: colors.border,
     overflow: 'hidden',
     backgroundColor: '#FFF9F3',
+  },
+  planWrap3d: {
+    // iOS GL surfaces don't always render reliably when clipped (borderRadius + overflow hidden).
+    overflow: 'visible',
+    borderRadius: 0,
   },
   planImage: { width: '100%', height: '100%' },
   planOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
