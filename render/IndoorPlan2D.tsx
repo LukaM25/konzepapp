@@ -23,6 +23,8 @@ export const IndoorPlan2D: React.FC<{
   imagePixelsPerMeter: number;
   style?: StyleProp<ViewStyle>;
   camera?: { follow?: boolean; zoom?: number; target?: Point2 | null; rotationDeg?: number };
+  gesturesEnabled?: boolean;
+  poiHitTestEnabled?: boolean;
   current?: Point2 | null;
   raw?: Point2 | null;
   headingDeg?: number;
@@ -37,6 +39,8 @@ export const IndoorPlan2D: React.FC<{
   imagePixelsPerMeter,
   style,
   camera,
+  gesturesEnabled = true,
+  poiHitTestEnabled = true,
   current,
   raw,
   headingDeg,
@@ -166,137 +170,152 @@ export const IndoorPlan2D: React.FC<{
     [onCameraChange],
   );
 
+  const content = (
+    <View style={{ flex: 1 }}>
+      <Pressable
+        style={{ flex: 1 }}
+        onPress={(e) => {
+          if (!layout) return;
+          const x = e.nativeEvent.locationX;
+          const y = e.nativeEvent.locationY;
+
+          // Invert: screen -> container
+          const dx = x - center.x;
+          const dy = y - center.y;
+          const dC = invScreenToContainerDelta(dx, dy);
+          const cx = targetC.x + dC.x;
+          const cy = targetC.y + dC.y;
+
+          // container -> image px -> meters
+          const ix = Math.max(0, Math.min(imgW, (cx - offsetX) / Math.max(0.0001, scale)));
+          const iy = Math.max(0, Math.min(imgH, (cy - offsetY) / Math.max(0.0001, scale)));
+          onTapMeters?.({ x: ix / ppm, y: iy / ppm }, { x: ix, y: iy });
+        }}
+      >
+        <View
+          style={{
+            flex: 1,
+            transform: [
+              { translateX: center.x },
+              { translateY: center.y },
+              { rotate: `${camRotDeg}deg` },
+              { scale: camZoom },
+              { translateX: -targetC.x },
+              { translateY: -targetC.y },
+            ],
+          }}
+        >
+          <Image source={source} style={styles.image} resizeMode="contain" />
+
+          <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+            {layout ? (
+              <>
+                {route && route.length > 1
+                  ? route.slice(0, -1).map((p, idx) => {
+                      const next = route[idx + 1];
+                      const a = toContainer(p);
+                      const b = toContainer(next);
+                      const dx2 = b.x - a.x;
+                      const dy2 = b.y - a.y;
+                      const len = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+                      const angle = Math.atan2(dy2, dx2);
+                      return (
+                        <View
+                          key={`seg-${idx}`}
+                          style={[
+                            styles.routeSeg,
+                            {
+                              width: len,
+                              left: a.x,
+                              top: a.y,
+                              transform: [{ translateX: -len / 2 }, { rotate: `${angle}rad` }],
+                            },
+                          ]}
+                        />
+                      );
+                    })
+                  : null}
+
+                {pois?.map((poi) => {
+                  const c = toContainer(poi);
+                  const isDest = destinationId === poi.id;
+                  if (!poiHitTestEnabled || !onSelectPoi) {
+                    return (
+                      <View
+                        key={poi.id}
+                        pointerEvents="none"
+                        style={[styles.poi, { left: c.x - 10, top: c.y - 10 }, isDest && styles.poiDest]}
+                      >
+                        <Text style={styles.poiText}>{isDest ? '★' : '•'}</Text>
+                      </View>
+                    );
+                  }
+                  return (
+                    <Pressable
+                      key={poi.id}
+                      onPress={() => onSelectPoi?.(poi.id)}
+                      style={[styles.poi, { left: c.x - 10, top: c.y - 10 }, isDest && styles.poiDest]}
+                      hitSlop={10}
+                    >
+                      <Text style={styles.poiText}>{isDest ? '★' : '•'}</Text>
+                    </Pressable>
+                  );
+                })}
+
+                {current ? (
+                  (() => {
+                    const c = toContainer(current);
+                    const h = headingDeg ?? 0;
+                    return (
+                      <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+                        {raw
+                          ? (() => {
+                              const r = toContainer(raw);
+                              return <View style={[styles.rawDot, { left: r.x - 4, top: r.y - 4 }]} />;
+                            })()
+                          : null}
+                        <View style={[styles.dot, { left: c.x - 7, top: c.y - 7 }]} />
+                        <View
+                          style={[
+                            styles.cone,
+                            {
+                              left: c.x,
+                              top: c.y,
+                              transform: [
+                                { translateX: -12 },
+                                { translateY: -18 },
+                                { rotate: `${h}deg` },
+                                { translateX: 12 },
+                                { translateY: 18 },
+                              ],
+                            },
+                          ]}
+                        />
+                      </View>
+                    );
+                  })()
+                ) : null}
+              </>
+            ) : null}
+          </View>
+        </View>
+      </Pressable>
+    </View>
+  );
+
   return (
     <View style={[styles.wrap, style]} onLayout={(e) => setLayout({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height })}>
-      <PanGestureHandler minDist={6} onGestureEvent={onPan} onHandlerStateChange={onPanStateChange}>
-        <RotationGestureHandler onGestureEvent={onRotate} onHandlerStateChange={onRotateStateChange}>
-          <PinchGestureHandler onGestureEvent={onPinch} onHandlerStateChange={onPinchStateChange}>
-            <View style={{ flex: 1 }}>
-              <Pressable
-                style={{ flex: 1 }}
-                onPress={(e) => {
-                  if (!layout) return;
-                  const x = e.nativeEvent.locationX;
-                  const y = e.nativeEvent.locationY;
-
-                  // Invert: screen -> container
-                  const dx = x - center.x;
-                  const dy = y - center.y;
-                  const dC = invScreenToContainerDelta(dx, dy);
-                  const cx = targetC.x + dC.x;
-                  const cy = targetC.y + dC.y;
-
-                  // container -> image px -> meters
-                  const ix = Math.max(0, Math.min(imgW, (cx - offsetX) / Math.max(0.0001, scale)));
-                  const iy = Math.max(0, Math.min(imgH, (cy - offsetY) / Math.max(0.0001, scale)));
-                  onTapMeters?.({ x: ix / ppm, y: iy / ppm }, { x: ix, y: iy });
-                }}
-              >
-                <View
-                  style={{
-                    flex: 1,
-                    transform: [
-                      { translateX: center.x },
-                      { translateY: center.y },
-                      { rotate: `${camRotDeg}deg` },
-                      { scale: camZoom },
-                      { translateX: -targetC.x },
-                      { translateY: -targetC.y },
-                    ],
-                  }}
-                >
-                  <Image source={source} style={styles.image} resizeMode="contain" />
-
-                  <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
-                    {layout ? (
-                      <>
-                        {route && route.length > 1
-                          ? route.slice(0, -1).map((p, idx) => {
-                              const next = route[idx + 1];
-                              const a = toContainer(p);
-                              const b = toContainer(next);
-                              const dx2 = b.x - a.x;
-                              const dy2 = b.y - a.y;
-                              const len = Math.sqrt(dx2 * dx2 + dy2 * dy2);
-                              const angle = Math.atan2(dy2, dx2);
-                              return (
-                                <View
-                                  key={`seg-${idx}`}
-                                  style={[
-                                    styles.routeSeg,
-                                    {
-                                      width: len,
-                                      left: a.x,
-                                      top: a.y,
-                                      transform: [{ translateX: -len / 2 }, { rotate: `${angle}rad` }],
-                                    },
-                                  ]}
-                                />
-                              );
-                            })
-                          : null}
-
-                        {pois?.map((poi) => {
-                          const c = toContainer(poi);
-                          const isDest = destinationId === poi.id;
-                          return (
-                            <Pressable
-                              key={poi.id}
-                              onPress={() => onSelectPoi?.(poi.id)}
-                              style={[
-                                styles.poi,
-                                { left: c.x - 10, top: c.y - 10 },
-                                isDest && styles.poiDest,
-                              ]}
-                              hitSlop={10}
-                            >
-                              <Text style={styles.poiText}>{isDest ? '★' : '•'}</Text>
-                            </Pressable>
-                          );
-                        })}
-
-                        {current ? (
-                          (() => {
-                            const c = toContainer(current);
-                            const h = headingDeg ?? 0;
-                            return (
-                              <View pointerEvents="none" style={StyleSheet.absoluteFill}>
-                                {raw
-                                  ? (() => {
-                                      const r = toContainer(raw);
-                                      return <View style={[styles.rawDot, { left: r.x - 4, top: r.y - 4 }]} />;
-                                    })()
-                                  : null}
-                                <View style={[styles.dot, { left: c.x - 7, top: c.y - 7 }]} />
-                                <View
-                                  style={[
-                                    styles.cone,
-                                    {
-                                      left: c.x,
-                                      top: c.y,
-                                      transform: [
-                                        { translateX: -12 },
-                                        { translateY: -18 },
-                                        { rotate: `${h}deg` },
-                                        { translateX: 12 },
-                                        { translateY: 18 },
-                                      ],
-                                    },
-                                  ]}
-                                />
-                              </View>
-                            );
-                          })()
-                        ) : null}
-                      </>
-                    ) : null}
-                  </View>
-                </View>
-              </Pressable>
-            </View>
-          </PinchGestureHandler>
-        </RotationGestureHandler>
-      </PanGestureHandler>
+      {gesturesEnabled ? (
+        <PanGestureHandler minDist={10} onGestureEvent={onPan} onHandlerStateChange={onPanStateChange}>
+          <RotationGestureHandler onGestureEvent={onRotate} onHandlerStateChange={onRotateStateChange}>
+            <PinchGestureHandler onGestureEvent={onPinch} onHandlerStateChange={onPinchStateChange}>
+              {content}
+            </PinchGestureHandler>
+          </RotationGestureHandler>
+        </PanGestureHandler>
+      ) : (
+        content
+      )}
     </View>
   );
 };

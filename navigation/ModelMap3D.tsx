@@ -239,10 +239,33 @@ export const ModelMap3D: React.FC<Props> = ({
           const mesh = obj as THREE.Mesh;
           if (!mesh.isMesh) return;
           mesh.frustumCulled = false;
+          const name = (obj.name ?? '').toLowerCase();
+          const isWall = name.includes('externalwalls') || name.includes('innerside') || name.includes('wall');
+
+          const applyOpacity = (m: THREE.Material, opacity: number) => {
+            const mat: any = m;
+            if (mat && typeof mat === 'object') {
+              mat.transparent = opacity < 1;
+              mat.opacity = opacity;
+              // Make walls see-through rather than just tinted (avoid depth buffer blocking).
+              mat.depthWrite = opacity >= 1 ? true : false;
+              mat.needsUpdate = true;
+            }
+          };
+
           if (Array.isArray(mesh.material)) {
-            mesh.material.forEach((m: THREE.Material) => (m.side = THREE.DoubleSide));
+            // Clone before mutation so shared materials don't unintentionally affect the whole model.
+            mesh.material = mesh.material.map((m: THREE.Material) => {
+              const cloned = m.clone();
+              cloned.side = THREE.DoubleSide;
+              if (isWall) applyOpacity(cloned, 0.75);
+              return cloned;
+            });
           } else if (mesh.material) {
-            mesh.material.side = THREE.DoubleSide;
+            const cloned = mesh.material.clone();
+            cloned.side = THREE.DoubleSide;
+            if (isWall) applyOpacity(cloned, 0.75);
+            mesh.material = cloned;
           }
         });
 
@@ -279,6 +302,9 @@ export const ModelMap3D: React.FC<Props> = ({
       const cameraPos = new THREE.Vector3();
       const targetPos = new THREE.Vector3();
       const desiredPos = new THREE.Vector3();
+      const userPos = new THREE.Vector3(0, 0, 0);
+      const desiredUser = new THREE.Vector3(0, 0, 0);
+      let userInit = false;
 
       const render = () => {
         try {
@@ -309,8 +335,8 @@ export const ModelMap3D: React.FC<Props> = ({
           const viewTarget = nowProps.follow
             ? (nowProps.target ?? null)
             : { x: nowProps.planMeters.width / 2, y: nowProps.planMeters.height / 2 };
-          const tx = viewTarget?.x ?? 0;
-          const tz = viewTarget?.y ?? 0;
+          const txRaw = viewTarget?.x ?? 0;
+          const tzRaw = viewTarget?.y ?? 0;
           const headingRad = (((nowProps.rotateWithHeading ? nowProps.headingDeg : 0) + (nowProps.bearingDeg ?? 0)) * Math.PI) / 180;
 
           const z = clamp(nowProps.zoom ?? 2, 1, 6);
@@ -319,11 +345,26 @@ export const ModelMap3D: React.FC<Props> = ({
           const bx = -Math.sin(headingRad) * back;
           const bz = Math.cos(headingRad) * back;
 
+          // Frame delta once (used for both user + camera smoothing).
+          const dt = clamp(clock.getDelta(), 0.001, 0.05);
+
+          desiredUser.set(txRaw, 0.0, tzRaw);
+          if (!userInit) {
+            userInit = true;
+            userPos.copy(desiredUser);
+          } else {
+            // Smooth the user target to avoid "teleporting" between nearby corridors.
+            const kUser = clamp(9 * dt, 0.05, 0.22);
+            userPos.lerp(desiredUser, kUser);
+          }
+
+          const tx = userPos.x;
+          const tz = userPos.z;
+
           targetPos.set(tx, 0.25, tz);
           desiredPos.set(tx + bx, height, tz + bz);
 
           // Smooth camera movement (critical for "Google Maps" feel).
-          const dt = clamp(clock.getDelta(), 0.001, 0.05);
           const k = clamp(10 * dt, 0.05, 0.35);
           cameraPos.lerp(desiredPos, k);
           camera2.position.copy(cameraPos);
@@ -428,7 +469,6 @@ export const ModelMap3D: React.FC<Props> = ({
       const worldDy = (-dx * sin + dy * cos) * metersPerPx;
 
       onCameraChange?.({
-        follow: false,
         target: { x: panStartTargetRef.current.x - worldDx, y: panStartTargetRef.current.y - worldDy },
       });
     },
@@ -445,7 +485,7 @@ export const ModelMap3D: React.FC<Props> = ({
   const onPinch = React.useCallback(
     (e: PinchGestureHandlerGestureEvent) => {
       const next = clamp(pinchStartZoomRef.current * e.nativeEvent.scale, 1, 6);
-      onCameraChange?.({ follow: false, zoom: next });
+      onCameraChange?.({ zoom: next });
     },
     [onCameraChange],
   );
@@ -460,7 +500,7 @@ export const ModelMap3D: React.FC<Props> = ({
   const onRotate = React.useCallback(
     (e: RotationGestureHandlerGestureEvent) => {
       const deltaDeg = (e.nativeEvent.rotation * 180) / Math.PI;
-      onCameraChange?.({ follow: false, bearingDeg: rotStartDegRef.current + deltaDeg });
+      onCameraChange?.({ bearingDeg: rotStartDegRef.current + deltaDeg });
     },
     [onCameraChange],
   );

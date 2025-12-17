@@ -15,13 +15,15 @@ import {
 } from '@expo-google-fonts/manrope';
 import { pilotStoreMap, type StoreMap, type StoreMapAnchor, type StoreMapNode } from './navigation/storeMap';
 import { computePolylineForOrder, computeRouteOrder } from './navigation/routing';
-import { planConfigs, type PlanId } from './navigation/houseFloorplan';
+import { NEUE_FIXED_PIXELS_PER_METER, planConfigs, type PlanId } from './navigation/houseFloorplan';
 import { ModelMap3D } from './navigation/ModelMap3D';
 import { IndoorPlan2D } from './render/IndoorPlan2D';
 import { useIndoorPositioning, type IndoorPositioningState } from './positioning/useIndoorPositioning';
 import { useIndoorNavigation } from './nav/useIndoorNavigation';
 
 const neueModel = require('./assets/wg.glb');
+const neueFixedStartPx = { x: 582, y: 728 };
+const neueFixedStartMeters = { x: neueFixedStartPx.x / NEUE_FIXED_PIXELS_PER_METER, y: neueFixedStartPx.y / NEUE_FIXED_PIXELS_PER_METER };
 
 type HouseholdRole = 'owner' | 'editor' | 'viewer';
 type HouseholdMember = {
@@ -1136,9 +1138,11 @@ const NavigationSection: React.FC<{
   const [mapFollow, setMapFollow] = React.useState(true);
   const [mapZoom, setMapZoom] = React.useState(2);
   const [mapView, setMapView] = React.useState<'3d' | '2d'>('2d');
+  const [map3dKey, setMap3dKey] = React.useState(0);
   const [mapRotate, setMapRotate] = React.useState(true);
   const [mapBearingDeg, setMapBearingDeg] = React.useState(0);
   const [freeTarget, setFreeTarget] = React.useState<PdrPoint | null>(null);
+  const [followOffset, setFollowOffset] = React.useState<PdrPoint>({ x: 0, y: 0 });
   const [navOn, setNavOn] = React.useState(false);
   const [destinationId, setDestinationId] = React.useState<string | null>(null);
   const [panel, setPanel] = React.useState<'route' | 'positioning' | 'setup'>('route');
@@ -1182,14 +1186,43 @@ const NavigationSection: React.FC<{
     reroute: { offRouteMeters: 2.2, persistMs: navOn ? 3000 : 1e9 },
   });
 
-  const cameraTarget = mapFollow ? mapTarget : (freeTarget ?? mapTarget);
+  const mapFollowRef = React.useRef(mapFollow);
+  const mapTargetRef = React.useRef(mapTarget);
+  React.useEffect(() => {
+    mapFollowRef.current = mapFollow;
+  }, [mapFollow]);
+  React.useEffect(() => {
+    mapTargetRef.current = mapTarget;
+  }, [mapTarget]);
+
+  const cameraTarget = mapFollow
+    ? mapTarget
+      ? { x: mapTarget.x + followOffset.x, y: mapTarget.y + followOffset.y }
+      : null
+    : (freeTarget ?? mapTarget);
+
   const onCameraChange = React.useCallback(
     (patch: { follow?: boolean; zoom?: number; target?: { x: number; y: number } | null; rotationDeg?: number; bearingDeg?: number }) => {
       if (patch.zoom !== undefined) setMapZoom((_) => clamp(patch.zoom ?? 2, 1, 6));
       if (patch.rotationDeg !== undefined) setMapBearingDeg(patch.rotationDeg ?? 0);
       if (patch.bearingDeg !== undefined) setMapBearingDeg(patch.bearingDeg ?? 0);
-      if (patch.target) setFreeTarget({ x: patch.target.x, y: patch.target.y });
-      if (patch.follow === false) setMapFollow(false);
+      if (patch.follow === true) {
+        setMapFollow(true);
+        setFreeTarget(null);
+        setFollowOffset({ x: 0, y: 0 });
+      } else if (patch.follow === false) {
+        setMapFollow(false);
+        setFollowOffset({ x: 0, y: 0 });
+      }
+      if (patch.target) {
+        const followOn = mapFollowRef.current;
+        const base = mapTargetRef.current;
+        if (followOn && base) {
+          setFollowOffset({ x: patch.target.x - base.x, y: patch.target.y - base.y });
+        } else {
+          setFreeTarget({ x: patch.target.x, y: patch.target.y });
+        }
+      }
     },
     [],
   );
@@ -1206,7 +1239,10 @@ const NavigationSection: React.FC<{
                   <Pressable
                     key={v}
                     style={[styles.segmentButton, mapView === v && styles.segmentButtonActive]}
-                    onPress={() => setMapView(v)}
+                    onPress={() => {
+                      setMapView(v);
+                      if (v === '3d') setMap3dKey((k) => k + 1);
+                    }}
                   >
                     <Text style={[styles.metaText, mapView === v && { color: colors.ink }]}>{v === '3d' ? '3D' : '2D'}</Text>
                   </Pressable>
@@ -1219,7 +1255,10 @@ const NavigationSection: React.FC<{
                 value={mapFollow}
                 onValueChange={(v) => {
                   setMapFollow(v);
-                  if (v) setFreeTarget(null);
+                  if (v) {
+                    setFreeTarget(null);
+                    setFollowOffset({ x: 0, y: 0 });
+                  }
                 }}
               />
             </View>
@@ -1271,6 +1310,7 @@ const NavigationSection: React.FC<{
       {isHouse ? (
         mapView === '3d' ? (
           <ModelMap3D
+            key={`3d-${map3dKey}`}
             style={[styles.planWrap, styles.planWrap3d]}
             model={neueModel}
             planMeters={planMeters}
@@ -1289,6 +1329,8 @@ const NavigationSection: React.FC<{
             style={styles.planWrap}
             source={planImage}
             imagePixelsPerMeter={planImagePixelsPerMeter}
+            gesturesEnabled={planTool !== 'measure'}
+            poiHitTestEnabled={planTool !== 'measure'}
             current={currentPose ? { x: currentPose.x, y: currentPose.y } : null}
             raw={positioning.rawPose ? { x: positioning.rawPose.x, y: positioning.rawPose.y } : null}
             headingDeg={currentPose?.headingDeg ?? 0}
@@ -1607,20 +1649,14 @@ const NavigationSection: React.FC<{
 
           <View style={styles.planControls}>
             <Text style={styles.metaText}>Scale (px/m)</Text>
-            <TextInput
-              style={[styles.searchInput, styles.floorInputSmall]}
-              placeholder="px / m"
-              keyboardType="numeric"
-              value={String(Math.round(planImagePixelsPerMeter))}
-              onChangeText={(v) => setPlanImagePixelsPerMeter(Number(v) || 1)}
-            />
+            <Badge label={`${NEUE_FIXED_PIXELS_PER_METER} (fixed)`} tone="accent" />
             <Pressable
               style={styles.ghostButton}
               onPress={() => {
                 setPlanCalA(null);
                 setPlanCalB(null);
                 setPlanCalMeters('');
-                if (planDefaultImagePixelsPerMeter) setPlanImagePixelsPerMeter(planDefaultImagePixelsPerMeter);
+                setPlanImagePixelsPerMeter(NEUE_FIXED_PIXELS_PER_METER);
               }}
             >
               <Ionicons name="refresh" size={16} color={colors.accent} />
@@ -1760,13 +1796,14 @@ export default function App() {
     const anchors = planAnchorsById.neue ?? [];
     return { ...activePlan.map, anchors };
   }, [navMapMode, activePlan, planAnchorsById]);
-  const [planImagePixelsPerMeter, setPlanImagePixelsPerMeter] = useState(
-    activePlan.defaultImagePixelsPerMeter ?? 90,
-  );
+  const [planImagePixelsPerMeter, setPlanImagePixelsPerMeter] = useState<number>(NEUE_FIXED_PIXELS_PER_METER);
+  const setPlanImagePixelsPerMeterFixed = React.useCallback((_n: number) => {
+    setPlanImagePixelsPerMeter(NEUE_FIXED_PIXELS_PER_METER);
+  }, []);
   const [planCalA, setPlanCalA] = useState<{ x: number; y: number } | null>(null);
   const [planCalB, setPlanCalB] = useState<{ x: number; y: number } | null>(null);
   const [planCalMeters, setPlanCalMeters] = useState('');
-  const [startOverride, setStartOverride] = useState<PdrPoint | null>(null);
+  const [startOverride, setStartOverride] = useState<PdrPoint | null>(neueFixedStartMeters);
   const [startNodeId, setStartNodeId] = useState<string>('entry');
   const [strideScale, setStrideScale] = useState(1);
   const [wifiCorrections, setWifiCorrections] = useState(Platform.OS !== 'ios');
@@ -2136,7 +2173,7 @@ export default function App() {
               mapMode={navMapMode}
 	              onChangeMapMode={(m) => {
 	                setNavMapMode(m);
-	                setStartOverride(null);
+	                setStartOverride(m === 'house' ? neueFixedStartMeters : null);
                   if (Platform.OS === 'ios') setWifiCorrections(false);
 	                setPlanCalA(null);
 	                setPlanCalB(null);
@@ -2148,7 +2185,7 @@ export default function App() {
 	              planId={planId}
 	              planImage={activePlan.image}
               planImagePixelsPerMeter={planImagePixelsPerMeter}
-              setPlanImagePixelsPerMeter={(n) => setPlanImagePixelsPerMeter(Math.max(1, Math.min(600, n)))}
+              setPlanImagePixelsPerMeter={setPlanImagePixelsPerMeterFixed}
               planDefaultImagePixelsPerMeter={activePlan.defaultImagePixelsPerMeter}
               planTool={planTool}
               setPlanTool={setPlanTool}
